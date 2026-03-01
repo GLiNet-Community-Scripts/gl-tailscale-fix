@@ -1,0 +1,256 @@
+#!/bin/sh
+# gl-tailscale-fix: Tailscale binary updater
+# Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
+# https://github.com/RemoteToHome-io/gl-tailscale-fix
+# Combined binaries from admonstrator/glinet-tailscale-updater
+set -e
+
+LOCK="/tmp/ts-fix-update.lock"
+STATUS="/tmp/ts-fix-update.status"
+CACHE="/tmp/ts-fix-latest-version"
+PLUGIN_CACHE="/tmp/ts-fix-plugin-latest-version"
+TS_BIN="/usr/sbin/tailscale"
+TS_DAEMON="/usr/sbin/tailscaled"
+SYSUPGRADE_CONF="/etc/sysupgrade.conf"
+
+# Combined multi-call binaries hosted by Admonstrator
+# These are single binaries that act as both tailscale CLI and tailscaled daemon
+# (standard pkgs.tailscale.com tarballs ship separate non-multi-call binaries
+# that are too large for flash-constrained routers)
+TINY_URL="https://github.com/Admonstrator/glinet-tailscale-updater/releases/latest/download"
+
+# Architecture mapping (matches Admonstrator's release naming)
+detect_arch() {
+    case "$(uname -m)" in
+        aarch64)    echo "arm64" ;;
+        armv7l)     echo "arm" ;;
+        mips)       echo "mips" ;;
+        mipsel)     echo "mipsle" ;;
+        x86_64)     echo "amd64" ;;
+        *)          echo "" ;;
+    esac
+}
+
+# Extract base version (X.Y.Z) from version strings like "1.94.2-tiny.by.admon.1187"
+base_ver() {
+    echo "$1" | sed 's/-.*//'
+}
+
+set_status() {
+    printf '{"status":"%s","message":"%s"}' "$1" "$2" > "$STATUS"
+}
+
+cleanup() {
+    rm -f "$LOCK"
+}
+
+# -- Check mode: query latest version and cache it --
+
+do_check() {
+    local latest
+    latest=$(wget -qO- "$TINY_URL/version.txt" 2>/dev/null)
+
+    if [ -n "$latest" ]; then
+        latest=$(base_ver "$latest")
+        echo "$latest" > "$CACHE"
+    fi
+}
+
+# -- Check plugin mode: query latest gl-tailscale-fix release from GitHub --
+
+do_check_plugin() {
+    local api_response
+    api_response=$(wget -qO- "https://api.github.com/repos/RemoteToHome-io/gl-tailscale-fix/releases/latest" 2>/dev/null)
+
+    if [ -z "$api_response" ]; then
+        # Private repo, network error, or rate limit — write empty to indicate checked but unavailable
+        echo "" > "$PLUGIN_CACHE"
+        return
+    fi
+
+    local tag_name release_url
+    tag_name=$(echo "$api_response" | jsonfilter -e '@.tag_name' 2>/dev/null)
+    release_url=$(echo "$api_response" | jsonfilter -e '@.html_url' 2>/dev/null)
+
+    if [ -n "$tag_name" ]; then
+        # Strip leading 'v' prefix (releases tagged as v1.0.11 → 1.0.11)
+        tag_name="${tag_name#v}"
+        printf '%s\n%s\n' "$tag_name" "$release_url" > "$PLUGIN_CACHE"
+    else
+        echo "" > "$PLUGIN_CACHE"
+    fi
+}
+
+# -- Install mode: download and install latest Tailscale --
+
+do_install() {
+    # Lock
+    if [ -f "$LOCK" ]; then
+        echo "Update already running"
+        exit 1
+    fi
+    echo $$ > "$LOCK"
+    trap cleanup EXIT
+
+    set_status "running" "Detecting architecture..."
+
+    local arch
+    arch=$(detect_arch)
+    if [ -z "$arch" ]; then
+        set_status "error" "Unsupported architecture: $(uname -m)"
+        exit 1
+    fi
+
+    set_status "running" "Checking latest version..."
+
+    # Get latest version from combined binary releases
+    local ver_raw latest_ver
+    ver_raw=$(wget -qO- "$TINY_URL/version.txt" 2>/dev/null)
+    if [ -z "$ver_raw" ]; then
+        set_status "error" "Failed to check latest version"
+        exit 1
+    fi
+
+    latest_ver=$(base_ver "$ver_raw")
+    if [ -z "$latest_ver" ]; then
+        set_status "error" "Could not determine latest version"
+        exit 1
+    fi
+
+    # Cache it
+    echo "$latest_ver" > "$CACHE"
+
+    # Check current version
+    local current_ver
+    current_ver=$(base_ver "$($TS_BIN version 2>/dev/null | head -1 | awk '{print $1}')")
+
+    if [ "$current_ver" = "$latest_ver" ]; then
+        set_status "success" "Already at latest version ($latest_ver)"
+        exit 0
+    fi
+
+    set_status "running" "Checking disk space..."
+
+    # Check free space (combined binary is ~6MB, need margin for download)
+    local free_kb
+    free_kb=$(df /usr/sbin/ | tail -1 | awk '{print $4}')
+    if [ "$free_kb" -lt 5120 ]; then
+        set_status "error" "Not enough disk space (need 5MB, have ${free_kb}KB)"
+        exit 1
+    fi
+
+    set_status "running" "Downloading Tailscale ${latest_ver}..."
+
+    # Download combined multi-call binary
+    local binary="tailscaled-linux-${arch}"
+    local url="$TINY_URL/${binary}"
+    local tmpfile="/tmp/$binary"
+
+    rm -f "$tmpfile"
+    if ! wget -qO "$tmpfile" "$url" 2>/dev/null; then
+        rm -f "$tmpfile"
+        set_status "error" "Download failed"
+        exit 1
+    fi
+
+    # Verify download isn't empty/truncated
+    local size
+    size=$(wc -c < "$tmpfile" 2>/dev/null || echo 0)
+    if [ "$size" -lt 1000000 ]; then
+        rm -f "$tmpfile"
+        set_status "error" "Download too small (${size} bytes) — may be corrupt"
+        exit 1
+    fi
+
+    set_status "running" "Installing binaries..."
+
+    # Stop tailscale
+    /etc/init.d/tailscale stop 2>/dev/null || true
+    sleep 1
+
+    # Install combined binary + symlink
+    rm -f "$TS_BIN" "$TS_DAEMON"
+    mv "$tmpfile" "$TS_DAEMON"
+    chmod 755 "$TS_DAEMON"
+    ln -sf tailscaled "$TS_BIN"
+
+    # Ensure binary persists across sysupgrade (only tailscaled needed —
+    # tailscale is a symlink that survives via ROM or postinst recreation)
+    if ! grep -qF "$TS_DAEMON" "$SYSUPGRADE_CONF" 2>/dev/null; then
+        echo "$TS_DAEMON" >> "$SYSUPGRADE_CONF"
+    fi
+
+    set_status "running" "Restarting Tailscale..."
+
+    # Restart tailscale
+    /etc/init.d/tailscale start 2>/dev/null || true
+
+    # Wait a moment for it to come up
+    sleep 3
+
+    local new_ver
+    new_ver=$(base_ver "$($TS_BIN version 2>/dev/null | head -1 | awk '{print $1}')")
+
+    set_status "success" "Updated to ${new_ver:-$latest_ver}"
+}
+
+# -- Restore mode: restore factory binaries --
+
+do_restore() {
+    if [ -f "$LOCK" ]; then
+        echo "Operation already running"
+        exit 1
+    fi
+    echo $$ > "$LOCK"
+    trap cleanup EXIT
+
+    set_status "running" "Restoring factory binaries..."
+
+    if [ ! -f "/rom${TS_DAEMON}" ]; then
+        set_status "error" "Factory binary not found: /rom${TS_DAEMON}"
+        exit 1
+    fi
+
+    # Stop tailscale
+    /etc/init.d/tailscale stop 2>/dev/null || true
+    sleep 1
+
+    # Restore from /rom/ (factory has tailscale as symlink to tailscaled —
+    # cp -a preserves symlinks, so this recreates the factory layout)
+    rm -f "$TS_BIN" "$TS_DAEMON"
+    cp -a "/rom${TS_BIN}" "$TS_BIN"
+    cp -a "/rom${TS_DAEMON}" "$TS_DAEMON"
+    chmod 755 "$TS_DAEMON"
+
+    # Remove from sysupgrade.conf (no longer need custom persistence)
+    if [ -f "$SYSUPGRADE_CONF" ]; then
+        sed -i "\|^${TS_BIN}$|d" "$SYSUPGRADE_CONF"
+        sed -i "\|^${TS_DAEMON}$|d" "$SYSUPGRADE_CONF"
+    fi
+
+    # Restart
+    /etc/init.d/tailscale start 2>/dev/null || true
+    sleep 3
+
+    local ver
+    ver=$($TS_BIN version 2>/dev/null | head -1 | awk '{print $1}')
+
+    set_status "success" "Restored to factory version (${ver:-unknown})"
+}
+
+# -- Main --
+
+case "$1" in
+    --check)         do_check ;;
+    --check-plugin)  do_check_plugin ;;
+    --install)       do_install ;;
+    --restore)       do_restore ;;
+    *)
+        echo "Usage: ts-fix-update [--check|--check-plugin|--install|--restore]"
+        echo "  --check         Check for latest Tailscale version (writes to $CACHE)"
+        echo "  --check-plugin  Check for latest gl-tailscale-fix release from GitHub"
+        echo "  --install       Download and install latest Tailscale"
+        echo "  --restore       Restore factory Tailscale binaries from /rom/"
+        exit 1
+        ;;
+esac

@@ -1,0 +1,193 @@
+#!/bin/sh
+# gl-tailscale-fix: Re-apply settings after GL's "tailscale up --reset"
+# Called by procd reload trigger (uci commit tailscale) and hotplug (ifup).
+# Waits for GL's gl_tailscale restart to finish, then re-applies exit node,
+# guest routes, firewall forwardings, and kill switch routing rules.
+# Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
+# https://github.com/RemoteToHome-io/gl-tailscale-fix
+
+enabled=$(uci -q get tailscale.settings.enabled)
+
+# If Tailscale is disabled, tear down all ts-fix state and exit.
+# This covers the case where a user disables Tailscale while our switches
+# are active — routing rules, firewall forwardings, and policy routes must
+# be cleaned up, and UCI settings reset to 0 so everything starts clean
+# when Tailscale is re-enabled.
+if [ "$enabled" != "1" ]; then
+    # Remove kill switch routing rules
+    ip rule del iif br-lan priority 5280 lookup 100 2>/dev/null
+    ip rule del iif br-guest priority 5280 lookup 100 2>/dev/null
+    ip route del unreachable default table 100 2>/dev/null
+
+    # Remove guest policy route fixup
+    _gs=$(ip -4 addr show br-guest 2>/dev/null | awk '/inet /{print $2}' | sed 's|\.[0-9]*/|.0/|')
+    [ -n "$_gs" ] && ip rule del to "$_gs" table main 2>/dev/null
+
+    # Remove legacy UCI firewall kill switch rules (pre-v1.0.9)
+    for section in ts_ks_lan2wan ts_ks_guest2wan; do
+        uci -q delete firewall.$section 2>/dev/null
+    done
+
+    # Remove guest<->tailscale firewall forwardings
+    _fw=0
+    [ -n "$(uci -q get firewall.ts_fix_guest2ts)" ] && {
+        uci -q delete firewall.ts_fix_guest2ts
+        uci -q delete firewall.ts_fix_ts2guest
+        _fw=1
+    }
+    [ "$_fw" = "1" ] && { uci commit firewall; /etc/init.d/firewall reload; }
+
+    # Reset all ts-fix UCI settings to 0
+    uci -q set ts-fix.settings.kill_switch=0
+    uci -q set ts-fix.settings.route_guest=0
+    uci -q set ts-fix.settings.advertise_exit_node=0
+    uci commit ts-fix
+
+    exit 0
+fi
+
+# Prevent concurrent runs (shared with hotplug and procd trigger)
+LOCK="/tmp/ts-fix-reapply.lock"
+exec 200>"$LOCK"
+flock -n 200 || exit 0
+trap 'rm -f "$LOCK"' EXIT
+
+# GL's 19-tailscale-iface calls "gl_tailscale restart &" (async).
+# That script does: tailscale restart -> network setup -> tailscale up --reset.
+# We MUST wait for gl_tailscale to finish, otherwise --reset clears our settings.
+
+# Wait for gl_tailscale to start (brief delay so the bg process appears)
+sleep 3
+
+# Wait for gl_tailscale to finish (up to 60s)
+i=0
+while [ $i -lt 60 ]; do
+    pgrep -f "gl_tailscale restart" >/dev/null 2>&1 || break
+    sleep 1
+    i=$((i + 1))
+done
+
+# Now wait for Running state (up to 30s)
+i=0
+state=""
+while [ $i -lt 30 ]; do
+    state=$(/usr/sbin/tailscale status --json 2>/dev/null | jsonfilter -e '@.BackendState' 2>/dev/null)
+    [ "$state" = "Running" ] && break
+    sleep 1
+    i=$((i + 1))
+done
+[ "$state" = "Running" ] || exit 0
+
+# Re-apply exit node advertisement
+adv=$(uci -q get ts-fix.settings.advertise_exit_node)
+if [ "$adv" = "1" ]; then
+    /usr/sbin/tailscale set --advertise-exit-node 2>/dev/null
+else
+    /usr/sbin/tailscale set --advertise-exit-node=false 2>/dev/null
+fi
+
+# Re-apply guest subnet route advertisement
+route_guest=$(uci -q get ts-fix.settings.route_guest)
+if [ "$route_guest" = "1" ]; then
+    # Get guest subnet from br-guest interface
+    guest_subnet=$(ip -4 addr show br-guest 2>/dev/null | awk '/inet /{print $2}' | sed 's|\.[0-9]*/|.0/|')
+    if [ -n "$guest_subnet" ]; then
+        # Get current routes, add guest subnet if missing
+        current=$(/usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.AdvertiseRoutes[*]' 2>/dev/null | tr '\n' ',')
+        case ",$current," in
+            *",$guest_subnet,"*) ;; # already present
+            *)
+                new_routes="${current}${guest_subnet}"
+                # Remove trailing comma
+                new_routes=$(echo "$new_routes" | sed 's/,$//')
+                /usr/sbin/tailscale set --advertise-routes="$new_routes" 2>/dev/null
+                ;;
+        esac
+    fi
+fi
+
+# Fix guest subnet policy route for exit node + kill switch compatibility.
+# Tailscale creates "from <guest_subnet> lookup main" at priority 0 when
+# the guest subnet is advertised. This blocks guest clients from using the
+# exit node AND bypasses the kill switch. Replace with "to <guest_subnet>"
+# (destination-based, matching Tailscale's LAN treatment).
+if [ "$route_guest" = "1" ] && [ -n "$guest_subnet" ]; then
+    ip rule del from "$guest_subnet" lookup main 2>/dev/null
+    ip rule del to "$guest_subnet" table main 2>/dev/null
+    ip rule add to "$guest_subnet" table main priority 0
+else
+    # Clean up our destination-based rule if present
+    _gs=$(ip -4 addr show br-guest 2>/dev/null | awk '/inet /{print $2}' | sed 's|\.[0-9]*/|.0/|')
+    [ -n "$_gs" ] && {
+        ip rule del to "$_gs" table main 2>/dev/null
+    }
+fi
+
+# Sync guest routing firewall forwardings
+if [ "$route_guest" = "1" ]; then
+    # Ensure guest<->tailscale forwardings exist
+    if [ -z "$(uci -q get firewall.ts_fix_guest2ts)" ]; then
+        uci set firewall.ts_fix_guest2ts=forwarding
+        uci set firewall.ts_fix_guest2ts.src=guest
+        uci set firewall.ts_fix_guest2ts.dest=tailscale0
+        uci set firewall.ts_fix_ts2guest=forwarding
+        uci set firewall.ts_fix_ts2guest.src=tailscale0
+        uci set firewall.ts_fix_ts2guest.dest=guest
+        uci commit firewall
+        /etc/init.d/firewall reload
+    fi
+else
+    # Remove guest<->tailscale forwardings if they exist
+    if [ -n "$(uci -q get firewall.ts_fix_guest2ts)" ]; then
+        uci -q delete firewall.ts_fix_guest2ts
+        uci -q delete firewall.ts_fix_ts2guest
+        uci commit firewall
+        /etc/init.d/firewall reload
+    fi
+fi
+
+# Migration: remove legacy UCI firewall kill switch rules (pre-v1.0.9)
+_legacy=0
+for section in ts_ks_lan2wan ts_ks_guest2wan; do
+    [ -n "$(uci -q get firewall.$section)" ] && {
+        uci -q delete firewall.$section; _legacy=1
+    }
+done
+[ "$_legacy" = "1" ] && { uci commit firewall; /etc/init.d/firewall reload; }
+
+# Sync kill switch routing rules (ip rule + ip route)
+# Uses policy routing instead of firewall rules to block before conntrack.
+# Table 100 = unreachable default, priority 5280 = after Tailscale's 5270.
+kill_switch=$(uci -q get ts-fix.settings.kill_switch)
+
+# Check actual tailscale exit node state — GL's UCI (tailscale.settings.exit_node_ip)
+# is unreliable because GL does not clear it when Custom Exit Node is disabled via
+# the admin panel (calls tailscale set --exit-node= but leaves UCI stale).
+exit_node_id=$(/usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.ExitNodeID' 2>/dev/null)
+
+# Auto-disable kill switch if enabled but no exit node configured.
+# This covers the case where a user disables Custom Exit Node while the
+# kill switch is active — without this, the KS routing rules remain active
+# but the KS toggle disappears from the UI (hidden when no exit node),
+# blocking all LAN/guest traffic with no way to turn it off.
+if [ "$kill_switch" = "1" ] && [ -z "$exit_node_id" ]; then
+    uci -q set ts-fix.settings.kill_switch=0
+    uci commit ts-fix
+    kill_switch="0"
+fi
+
+if [ "$kill_switch" = "1" ] && [ -n "$exit_node_id" ]; then
+    # Ensure table 100 has unreachable default
+    ip route show table 100 2>/dev/null | grep -q "unreachable default" || \
+        ip route add unreachable default table 100
+    # Add ip rules for br-lan and br-guest (idempotent)
+    ip rule list priority 5280 2>/dev/null | grep -q "iif br-lan" || \
+        ip rule add iif br-lan priority 5280 lookup 100
+    ip rule list priority 5280 2>/dev/null | grep -q "iif br-guest" || \
+        ip rule add iif br-guest priority 5280 lookup 100
+else
+    # Remove kill switch routing rules (suppress errors if not present)
+    ip rule del iif br-lan priority 5280 lookup 100 2>/dev/null
+    ip rule del iif br-guest priority 5280 lookup 100 2>/dev/null
+    ip route del unreachable default table 100 2>/dev/null
+fi

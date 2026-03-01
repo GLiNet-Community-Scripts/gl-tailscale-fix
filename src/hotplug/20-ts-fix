@@ -1,0 +1,18 @@
+#!/bin/sh
+# gl-tailscale-fix hotplug — priority 20 (after GL's 19-tailscale-iface)
+# Re-applies ts-fix settings after GL's "tailscale up --reset" clears them.
+# Also handles teardown when Tailscale is disabled (mirrors GL's pattern in
+# 19-tailscale-iface: any hotplug event with enabled=0 triggers cleanup).
+# Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
+# https://github.com/RemoteToHome-io/gl-tailscale-fix
+
+enabled=$(uci -q get tailscale.settings.enabled)
+
+if [ "$ACTION" = "ifup" ] && [ "$enabled" = "1" ]; then
+    [ "$INTERFACE" = "loopback" ] && exit 0
+    # Delegate to shared reapply script (handles locking, waiting, re-applying)
+    /usr/bin/ts-fix-reapply
+elif [ "$enabled" != "1" ]; then
+    # Tailscale disabled — run teardown (ts-fix-reapply handles the disabled case)
+    /usr/bin/ts-fix-reapply
+fi

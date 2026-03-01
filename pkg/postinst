@@ -1,0 +1,42 @@
+#!/bin/sh
+# gl-tailscale-fix: post-install script
+# Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
+# https://github.com/RemoteToHome-io/gl-tailscale-fix
+
+# Restore user config saved by prerm (handles --force-reinstall which
+# runs full teardown because opkg doesn't set PKG_UPGRADE=1).
+# Precedence: saved config > existing config > default template.
+if [ -f /tmp/ts-fix-config.saved ]; then
+    mv /tmp/ts-fix-config.saved /etc/config/ts-fix
+elif [ ! -f /etc/config/ts-fix ]; then
+    cp /etc/config/ts-fix.default /etc/config/ts-fix
+fi
+
+# Ensure tailscale CLI symlink exists (combined binary installs only have
+# tailscaled; the symlink may be missing after sysupgrade or manual cleanup)
+if [ -f /usr/sbin/tailscaled ] && [ ! -e /usr/sbin/tailscale ]; then
+    ln -sf tailscaled /usr/sbin/tailscale
+fi
+
+# Enable and start procd service (registers UCI reload trigger for tailscale config)
+if [ -x /etc/init.d/ts-fix ]; then
+    /etc/init.d/ts-fix enable 2>/dev/null
+    /etc/init.d/ts-fix start 2>/dev/null
+fi
+
+# Restart nginx to pick up new/updated RPC module and injection config
+# (reload does NOT reliably clear module cache on GL routers)
+if [ -x /etc/init.d/nginx ]; then
+    kill -9 $(pgrep nginx) 2>/dev/null
+    /etc/init.d/nginx start 2>/dev/null
+fi
+
+# Re-apply settings (exit node advertisement, kill switch, guest routing).
+# Needed after --force-reinstall since prerm tears down firewall rules and
+# tailscale flags. Runs in background to not block opkg — ts-fix-reapply
+# handles its own timing (waits for tailscale Running state, uses flock).
+if [ -x /usr/bin/ts-fix-reapply ]; then
+    /usr/bin/ts-fix-reapply &
+fi
+
+exit 0

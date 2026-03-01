@@ -1,0 +1,4 @@
+config settings 'settings'
+	option advertise_exit_node '0'
+	option kill_switch '0'
+	option route_guest '0'

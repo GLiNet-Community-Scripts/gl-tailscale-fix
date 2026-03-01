@@ -1,0 +1,44 @@
+#!/bin/sh
+# gl-tailscale-fix: Watchdog for Tailscale state changes
+# Polls every 5 seconds. Detects:
+# 1. Tailscale disabled → full teardown (all ts-fix state removed)
+# 2. Exit node removed while kill switch active → auto-disable KS
+# This is necessary because procd_add_reload_trigger does NOT work on GL
+# firmware (uci commit does not emit config.change events), and GL's admin
+# panel does not notify ts-fix when it changes exit node settings.
+# Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
+# https://github.com/RemoteToHome-io/gl-tailscale-fix
+
+prev=$(uci -q get tailscale.settings.enabled)
+
+while true; do
+    sleep 5
+    curr=$(uci -q get tailscale.settings.enabled)
+
+    # Detect Tailscale disabled
+    if [ "$prev" = "1" ] && [ "$curr" != "1" ]; then
+        logger -t ts-fix "Tailscale disabled — running teardown"
+        /usr/bin/ts-fix-reapply
+    fi
+
+    # Detect exit node removed while kill switch active.
+    # GL does not notify us when Custom Exit Node is disabled — it clears
+    # the exit node in tailscale but leaves its own UCI stale. Without this
+    # check, KS routing rules blackhole all traffic indefinitely.
+    if [ "$curr" = "1" ]; then
+        ks=$(uci -q get ts-fix.settings.kill_switch)
+        if [ "$ks" = "1" ]; then
+            exit_id=$(/usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.ExitNodeID' 2>/dev/null)
+            if [ -z "$exit_id" ]; then
+                # Confirm tailscale is Running (not mid-restart where prefs are transiently empty)
+                state=$(/usr/sbin/tailscale status --json 2>/dev/null | jsonfilter -e '@.BackendState' 2>/dev/null)
+                if [ "$state" = "Running" ]; then
+                    logger -t ts-fix "Exit node removed while kill switch active — auto-disabling"
+                    /usr/bin/ts-fix-reapply
+                fi
+            fi
+        fi
+    fi
+
+    prev="$curr"
+done

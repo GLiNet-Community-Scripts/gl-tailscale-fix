@@ -1,0 +1,464 @@
+--[[
+    @object-name: ts-fix
+    @object-desc: Tailscale enhancements for GL.iNet routers (gl-tailscale-fix)
+    Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
+    https://github.com/RemoteToHome-io/gl-tailscale-fix
+--]]
+
+local uci = require "uci"
+local cjson = require "cjson"
+local fs = require "oui.fs"
+
+local M = {}
+
+local TS_FIX_CONFIG = "ts-fix"
+local FW_CONFIG = "firewall"
+local TS_CONFIG = "tailscale"
+
+-- Helper: strip version suffix (e.g. "1.94.2-tiny.by.admon.1187" → "1.94.2")
+local function base_ver(v)
+    if v then return v:match("^([%d%.]+)") end
+    return v
+end
+
+-- Helper: run a command and return stdout
+local function exec(cmd)
+    local r = ngx.pipe.spawn({"sh", "-c", cmd})
+    if r then
+        local data = r:stdout_read_all()
+        r:wait()
+        return data
+    end
+    return nil
+end
+
+-- Helper: run a command and return exit code
+local function exec_rc(cmd)
+    local r = ngx.pipe.spawn({"sh", "-c", cmd})
+    if r then
+        r:stdout_read_all()
+        local ok, reason, code = r:wait()
+        if ok then return 0 end
+        return code or 1
+    end
+    return 1
+end
+
+-- Helper: get tailscale status JSON
+local function tailscale_status()
+    local data = exec("timeout 3 /usr/sbin/tailscale status --json 2>/dev/null")
+    if data and #data > 0 then
+        local ok, r = pcall(cjson.decode, data)
+        if ok and type(r) == "table" then
+            return r
+        end
+    end
+    return nil
+end
+
+-- Helper: get guest subnet CIDR from br-guest interface
+local function get_guest_subnet()
+    local data = exec("ip -4 addr show br-guest 2>/dev/null")
+    if data then
+        local a, b, c, prefix = data:match("inet (%d+)%.(%d+)%.(%d+)%.%d+/(%d+)")
+        if a then
+            return a .. "." .. b .. "." .. c .. ".0/" .. prefix
+        end
+    end
+    return nil
+end
+
+-- Helper: get currently advertised routes from tailscale prefs
+local function get_current_routes()
+    local data = exec("/usr/sbin/tailscale debug prefs 2>/dev/null")
+    if data then
+        local ok, prefs = pcall(cjson.decode, data)
+        if ok and type(prefs.AdvertiseRoutes) == "table" then
+            return prefs.AdvertiseRoutes
+        end
+    end
+    return {}
+end
+
+-- Helper: update advertised routes, adding or removing guest subnet
+local function update_guest_route(enable)
+    local guest_subnet = get_guest_subnet()
+    if not guest_subnet then return end
+
+    local routes = get_current_routes()
+    local new_routes = {}
+    local found = false
+
+    for _, route in ipairs(routes) do
+        if route == guest_subnet then
+            found = true
+            if enable then
+                new_routes[#new_routes + 1] = route
+            end
+        else
+            new_routes[#new_routes + 1] = route
+        end
+    end
+
+    if enable and not found then
+        new_routes[#new_routes + 1] = guest_subnet
+    end
+
+    local routes_str = table.concat(new_routes, ",")
+    exec("/usr/sbin/tailscale set --advertise-routes=" .. routes_str .. " 2>/dev/null")
+end
+
+-- Helper: set guest→tailscale firewall forwardings enabled/disabled
+local function set_guest_ts_fw(enabled)
+    local c = uci.cursor()
+    local changed = false
+
+    local forwardings = {
+        {name = "ts_fix_guest2ts", src = "guest", dest = "tailscale0"},
+        {name = "ts_fix_ts2guest", src = "tailscale0", dest = "guest"},
+    }
+
+    for _, fwd in ipairs(forwardings) do
+        local exists = c:get(FW_CONFIG, fwd.name)
+        if exists and not enabled then
+            c:delete(FW_CONFIG, fwd.name)
+            changed = true
+        elseif not exists and enabled then
+            c:set(FW_CONFIG, fwd.name, "forwarding")
+            c:set(FW_CONFIG, fwd.name, "src", fwd.src)
+            c:set(FW_CONFIG, fwd.name, "dest", fwd.dest)
+            changed = true
+        end
+    end
+
+    if changed then
+        c:commit(FW_CONFIG)
+        ngx.pipe.spawn({"/etc/init.d/firewall", "reload"})
+    end
+
+    return changed
+end
+
+-- Helper: fix guest subnet policy route for exit node compatibility.
+-- When the guest subnet is advertised, Tailscale creates a source-based rule
+-- at priority 0: "from <guest_subnet> lookup main". This catches ALL traffic
+-- originating from guest clients and sends it to the main table → WAN,
+-- completely bypassing the exit node (priority 5270) AND the kill switch
+-- (priority 5280). Replace with a destination-based rule: "to <guest_subnet>
+-- table main" (matching Tailscale's own treatment of the LAN subnet). This
+-- preserves inbound tailnet→guest reachability while letting guest clients
+-- use the exit node. Confirmed by GL engineer prototype (gl_tailscale-guest).
+local function fix_guest_policy_route(enabled)
+    local guest_subnet = get_guest_subnet()
+    if not guest_subnet then return end
+
+    -- Always clean up both rule types to avoid duplicates
+    exec("ip rule del from " .. guest_subnet .. " lookup main 2>/dev/null")
+    exec("ip rule del to " .. guest_subnet .. " table main 2>/dev/null")
+
+    if enabled then
+        exec("ip rule add to " .. guest_subnet .. " table main priority 0")
+    end
+end
+
+-- Helper: set kill switch routing rules (ip rule + ip route)
+-- Uses policy routing instead of firewall rules to block before conntrack.
+-- Table 100 = unreachable default, priority 5280 = after Tailscale's 5270.
+local function set_killswitch_route(enabled)
+    if enabled then
+        -- Ensure table 100 has unreachable default
+        local rt = exec("ip route show table 100 2>/dev/null") or ""
+        if not rt:match("unreachable default") then
+            exec("ip route add unreachable default table 100")
+        end
+        -- Add ip rules for br-lan and br-guest (idempotent)
+        local rules = exec("ip rule list priority 5280 2>/dev/null") or ""
+        if not rules:match("iif br%-lan") then
+            exec("ip rule add iif br-lan priority 5280 lookup 100")
+        end
+        if not rules:match("iif br%-guest") then
+            exec("ip rule add iif br-guest priority 5280 lookup 100")
+        end
+    else
+        -- Remove ip rules and route (suppress errors if not present)
+        exec("ip rule del iif br-lan priority 5280 lookup 100 2>/dev/null")
+        exec("ip rule del iif br-guest priority 5280 lookup 100 2>/dev/null")
+        exec("ip route del unreachable default table 100 2>/dev/null")
+    end
+end
+
+--[[
+    @method-type: call
+    @method-name: get_config
+    @method-desc: Get ts-fix configuration and live Tailscale state
+
+    @out bool   advertise_exit_node    Whether exit node advertisement is enabled
+    @out bool   kill_switch            Whether kill switch is enabled
+    @out bool   route_guest            Whether guest network routing via Tailscale is enabled
+    @out bool   exit_node_active       Whether this node is currently advertising as exit node (live)
+    @out bool   ts_enabled             Whether Tailscale is enabled
+    @out bool   ts_running             Whether Tailscale is in Running state
+    @out string ts_version             Installed Tailscale version
+    @out string exit_node_ip           Currently configured remote exit node IP (from GL config)
+    @out bool   kill_switch_fw_active  Whether kill switch routing rules are currently active
+    @out bool   route_guest_fw_active  Whether guest→tailscale forwardings are currently active
+--]]
+function M.get_config()
+    local c = uci.cursor()
+    local res = {}
+
+    -- Our UCI settings
+    res.advertise_exit_node = c:get(TS_FIX_CONFIG, "settings", "advertise_exit_node") == "1"
+    res.kill_switch = c:get(TS_FIX_CONFIG, "settings", "kill_switch") == "1"
+    res.route_guest = c:get(TS_FIX_CONFIG, "settings", "route_guest") == "1"
+
+    -- GL's Tailscale UCI settings
+    res.ts_enabled = c:get(TS_CONFIG, "settings", "enabled") == "1"
+    res.wan_enabled = c:get(TS_CONFIG, "settings", "wan_enabled") == "1"
+    res.exit_node_ip = c:get(TS_CONFIG, "settings", "exit_node_ip") or ""
+
+    -- Live tailscale state
+    local status = tailscale_status()
+    if status then
+        res.ts_running = status.BackendState == "Running"
+        if status.Self then
+            res.exit_node_active = status.Self.ExitNodeOption == true
+        end
+    else
+        res.ts_running = false
+        res.exit_node_active = false
+    end
+
+    -- Installed version (strip suffix from combined builds)
+    local ver = exec("/usr/sbin/tailscale version 2>/dev/null")
+    if ver then
+        res.ts_version = base_ver(ver:match("^(%S+)")) or "unknown"
+    else
+        res.ts_version = "unknown"
+    end
+
+    -- Kill switch routing rule state (ip rules for table 100 at priority 5280)
+    local ks_rules = exec("ip rule list priority 5280 2>/dev/null") or ""
+    res.kill_switch_fw_active = ks_rules:match("lookup 100") ~= nil
+
+    -- Guest routing firewall forwarding state
+    res.route_guest_fw_active = c:get(FW_CONFIG, "ts_fix_guest2ts") ~= nil
+
+    return res
+end
+
+--[[
+    @method-type: call
+    @method-name: set_config
+    @method-desc: Apply ts-fix configuration changes
+
+    @in  bool  ?advertise_exit_node   Enable/disable exit node advertisement
+    @in  bool  ?kill_switch           Enable/disable kill switch
+    @in  bool  ?route_guest           Enable/disable guest network routing via Tailscale
+--]]
+function M.set_config(params)
+    local c = uci.cursor()
+
+    -- Check tailscale is enabled
+    local ts_enabled = c:get(TS_CONFIG, "settings", "enabled") == "1"
+    if not ts_enabled then
+        return { err_code = -1, err_msg = "Tailscale is not enabled" }
+    end
+
+    local exit_node_changed = false
+    local route_changed = false
+
+    -- Handle advertise_exit_node
+    if params.advertise_exit_node ~= nil then
+        local val = params.advertise_exit_node and "1" or "0"
+        c:set(TS_FIX_CONFIG, "settings", "advertise_exit_node", val)
+        exit_node_changed = true
+    end
+
+    -- Handle kill_switch
+    if params.kill_switch ~= nil then
+        local val = params.kill_switch and "1" or "0"
+        c:set(TS_FIX_CONFIG, "settings", "kill_switch", val)
+        set_killswitch_route(params.kill_switch)
+    end
+
+    -- Handle route_guest
+    if params.route_guest ~= nil then
+        local val = params.route_guest and "1" or "0"
+        c:set(TS_FIX_CONFIG, "settings", "route_guest", val)
+        set_guest_ts_fw(params.route_guest)
+        route_changed = true
+    end
+
+    c:commit(TS_FIX_CONFIG)
+    fs.sync()
+
+    -- Apply exit node setting (only when it was actually changed)
+    if exit_node_changed then
+        local advertise = c:get(TS_FIX_CONFIG, "settings", "advertise_exit_node") == "1"
+        if advertise then
+            exec("/usr/sbin/tailscale set --advertise-exit-node 2>/dev/null")
+        else
+            exec("/usr/sbin/tailscale set --advertise-exit-node=false 2>/dev/null")
+        end
+    end
+
+    -- Apply route changes (only when route_guest was actually changed)
+    if route_changed then
+        local rg = c:get(TS_FIX_CONFIG, "settings", "route_guest") == "1"
+        update_guest_route(rg)
+        -- Fix policy route: swap Tailscale's "from <guest>" (blocks exit node
+        -- + kill switch) with "to <guest>" (allows both). Must run after
+        -- update_guest_route which triggers Tailscale to create its rules.
+        fix_guest_policy_route(rg)
+    end
+
+    return {}
+end
+
+--[[
+    @method-type: call
+    @method-name: get_update_info
+    @method-desc: Get installed and latest Tailscale version info
+
+    @out string installed_version   Currently installed version
+    @out string latest_version      Latest stable version available
+    @out bool   update_available    Whether an update is available
+    @out string arch                Detected architecture
+--]]
+function M.get_update_info()
+    local res = {}
+
+    -- Installed version (strip suffix from combined builds)
+    local ver = exec("/usr/sbin/tailscale version 2>/dev/null")
+    res.installed_version = ver and base_ver(ver:match("^(%S+)")) or "unknown"
+
+    -- Architecture
+    local arch = exec("uname -m 2>/dev/null")
+    res.arch = arch and arch:match("^(%S+)") or "unknown"
+
+    -- Check for cached latest version (updated by ts-fix-update --check)
+    local cache_file = "/tmp/ts-fix-latest-version"
+    if fs.access(cache_file) then
+        local f = io.open(cache_file, "r")
+        if f then
+            res.latest_version = f:read("*l") or "unknown"
+            f:close()
+        end
+    else
+        -- Trigger async version check
+        ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--check"})
+        res.latest_version = "checking..."
+    end
+
+    if res.installed_version ~= "unknown" and res.latest_version ~= "unknown"
+       and res.latest_version ~= "checking..." then
+        res.update_available = res.installed_version ~= res.latest_version
+    else
+        res.update_available = false
+    end
+
+    return res
+end
+
+--[[
+    @method-type: call
+    @method-name: do_update
+    @method-desc: Update Tailscale to the latest version
+
+    @out number ?err_code   Error code
+    @out string ?err_msg    Error message
+    @out string ?status     Status message
+--]]
+function M.do_update()
+    -- Check if update is already running
+    if fs.access("/tmp/ts-fix-update.lock") then
+        return { err_code = -1, err_msg = "Update already in progress" }
+    end
+
+    -- Launch update in background
+    ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--install"})
+
+    return { status = "update_started" }
+end
+
+--[[
+    @method-type: call
+    @method-name: get_update_status
+    @method-desc: Get status of a running or completed update
+
+    @out string status   "idle", "running", "success", "error"
+    @out string message  Status or error message
+--]]
+function M.get_update_status()
+    local status_file = "/tmp/ts-fix-update.status"
+    if fs.access(status_file) then
+        local f = io.open(status_file, "r")
+        if f then
+            local content = f:read("*a")
+            f:close()
+            local ok, data = pcall(cjson.decode, content)
+            if ok then return data end
+        end
+    end
+    return { status = "idle", message = "" }
+end
+
+--[[
+    @method-type: call
+    @method-name: do_restore
+    @method-desc: Restore factory Tailscale binaries from /rom/
+
+    @out number ?err_code   Error code
+    @out string ?err_msg    Error message
+--]]
+function M.do_restore()
+    -- Check /rom/ has factory binaries
+    if not fs.access("/rom/usr/sbin/tailscale") then
+        return { err_code = -1, err_msg = "Factory binaries not found in /rom/" }
+    end
+
+    ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--restore"})
+    return { status = "restore_started" }
+end
+
+--[[
+    @method-type: call
+    @method-name: get_plugin_info
+    @method-desc: Get latest gl-tailscale-fix version from GitHub releases
+
+    @out string latest_version   Latest plugin version ("checking...", "unavailable", or version string)
+    @out string release_url      URL to the latest release page
+--]]
+function M.get_plugin_info()
+    local res = {}
+    local cache_file = "/tmp/ts-fix-plugin-latest-version"
+
+    if fs.access(cache_file) then
+        local f = io.open(cache_file, "r")
+        if f then
+            local version = f:read("*l") or ""
+            local url = f:read("*l") or ""
+            f:close()
+            if version ~= "" then
+                res.latest_version = version
+                res.release_url = url
+            else
+                res.latest_version = "unavailable"
+                res.release_url = ""
+            end
+        else
+            res.latest_version = "unavailable"
+            res.release_url = ""
+        end
+    else
+        -- Trigger async version check
+        ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--check-plugin"})
+        res.latest_version = "checking..."
+        res.release_url = ""
+    end
+
+    return res
+end
+
+return M

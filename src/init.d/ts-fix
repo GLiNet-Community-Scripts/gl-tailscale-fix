@@ -1,0 +1,19 @@
+#!/bin/sh /etc/rc.common
+# gl-tailscale-fix: procd service with watchdog for teardown detection
+# The watchdog polls tailscale.settings.enabled every 5 seconds. When it
+# transitions from enabled to disabled, it runs ts-fix-reapply (teardown).
+# procd_add_reload_trigger does NOT work on GL firmware (uci commit does not
+# emit config.change events), and iface hotplug events do not fire reliably
+# when Tailscale is disabled — the watchdog is the reliable teardown path.
+# Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
+# https://github.com/RemoteToHome-io/gl-tailscale-fix
+
+START=99
+USE_PROCD=1
+
+start_service() {
+    procd_open_instance
+    procd_set_param command /usr/bin/ts-fix-watchdog
+    procd_set_param respawn 3600 5 5
+    procd_close_instance
+}

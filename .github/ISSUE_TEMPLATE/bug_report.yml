@@ -1,0 +1,89 @@
+name: Bug Report
+description: Report a bug with gl-tailscale-fix
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please fill out the sections below so we can reproduce and fix the issue.
+
+  - type: input
+    id: router-model
+    attributes:
+      label: Router Model
+      description: GL.iNet model name (e.g., GL-AXT1800, GL-MT3000, GL-MT6000)
+      placeholder: GL-AXT1800
+    validations:
+      required: true
+
+  - type: input
+    id: firmware-version
+    attributes:
+      label: Firmware Version
+      description: GL.iNet firmware version (check SYSTEM > Upgrade)
+      placeholder: "4.8.2"
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: gl-tailscale-fix Version
+      description: Shown in the "Tailscale Enhanced" section header
+      placeholder: "1.0.11"
+    validations:
+      required: true
+
+  - type: input
+    id: tailscale-version
+    attributes:
+      label: Tailscale Version
+      description: Shown in the Tailscale Version row (factory or updated)
+      placeholder: "1.80.3"
+
+  - type: dropdown
+    id: feature
+    attributes:
+      label: Which feature is affected?
+      options:
+        - Kill Switch
+        - Allow Remote Access Guest
+        - Advertise as Exit Node
+        - Tailscale Version Manager
+        - UI / Display
+        - Install / Upgrade / Remove
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug. What did you expect to happen vs. what actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: How can we reproduce this?
+      placeholder: |
+        1. Enable Custom Exit Node and enter IP...
+        2. Enable Kill Switch...
+        3. Click Apply...
+        4. Observe...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        If applicable, include output from:
+        - `logread | grep ts-fix` (syslog messages)
+        - `ip rule list` (routing rules)
+        - `uci show ts-fix` (plugin config)
+      render: shell

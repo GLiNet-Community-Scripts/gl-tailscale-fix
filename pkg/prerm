@@ -1,0 +1,54 @@
+#!/bin/sh
+# gl-tailscale-fix: pre-remove script
+# Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
+# https://github.com/RemoteToHome-io/gl-tailscale-fix
+
+# Always preserve config so postinst can restore it after reinstall.
+# opkg --force-reinstall does NOT set PKG_UPGRADE=1, so the teardown
+# below would destroy user settings. Saving to /tmp lets postinst
+# restore the config regardless of whether this is a removal, upgrade,
+# or reinstall.
+cp /etc/config/ts-fix /tmp/ts-fix-config.saved 2>/dev/null
+
+# On upgrade, skip teardown — new version takes over
+[ "$PKG_UPGRADE" = "1" ] && exit 0
+
+# Stop and disable procd service (removes UCI reload trigger)
+if [ -x /etc/init.d/ts-fix ]; then
+    /etc/init.d/ts-fix stop 2>/dev/null
+    /etc/init.d/ts-fix disable 2>/dev/null
+fi
+
+# Disable exit node advertisement
+/usr/sbin/tailscale set --advertise-exit-node=false 2>/dev/null
+
+# Remove kill switch routing rules
+ip rule del iif br-lan priority 5280 lookup 100 2>/dev/null
+ip rule del iif br-guest priority 5280 lookup 100 2>/dev/null
+ip route del unreachable default table 100 2>/dev/null
+
+# Remove guest subnet policy route fixup
+_gs=$(ip -4 addr show br-guest 2>/dev/null | awk '/inet /{print $2}' | sed 's|\.[0-9]*/|.0/|')
+[ -n "$_gs" ] && ip rule del to "$_gs" table main 2>/dev/null
+
+# Remove guest routing firewall forwardings (and legacy kill switch rules)
+for section in ts_fix_guest2ts ts_fix_ts2guest ts_ks_lan2wan ts_ks_guest2wan; do
+    uci -q delete firewall."$section" 2>/dev/null
+done
+uci commit firewall 2>/dev/null
+/etc/init.d/firewall reload 2>/dev/null
+
+# Clean up empty directories (opkg doesn't remove them)
+rm -rf /usr/share/ts-fix
+
+# Remove UCI config
+rm -f /etc/config/ts-fix
+
+# Restart nginx to remove our injection
+# (reload does NOT reliably update all workers on GL routers)
+if [ -x /etc/init.d/nginx ]; then
+    kill -9 $(pgrep nginx) 2>/dev/null
+    /etc/init.d/nginx start 2>/dev/null
+fi
+
+exit 0

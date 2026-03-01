@@ -1,0 +1,59 @@
+name: Model Compatibility Report
+description: Report test results for a GL.iNet router model
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tested gl-tailscale-fix on a new router model? We'd love to add it to the compatibility matrix.
+
+  - type: input
+    id: router-model
+    attributes:
+      label: Router Model
+      description: GL.iNet model name (e.g., GL-AXT1800, GL-MT3000)
+      placeholder: GL-MT6000
+    validations:
+      required: true
+
+  - type: input
+    id: firmware-version
+    attributes:
+      label: Firmware Version
+      placeholder: "4.8.3"
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: gl-tailscale-fix Version Tested
+      placeholder: "1.0.11"
+    validations:
+      required: true
+
+  - type: input
+    id: tailscale-version
+    attributes:
+      label: Factory Tailscale Version
+      description: Version before any updates
+      placeholder: "1.80.3"
+
+  - type: checkboxes
+    id: tests
+    attributes:
+      label: What did you verify?
+      options:
+        - label: "Install (opkg install)"
+        - label: "Uninstall (opkg remove)"
+        - label: "UI injection (controls appear on Tailscale page)"
+        - label: "Advertise as Exit Node"
+        - label: "Kill Switch"
+        - label: "Allow Remote Access Guest"
+        - label: "Tailscale Version Manager (update/restore)"
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Any issues, quirks, or additional observations.

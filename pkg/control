@@ -1,0 +1,10 @@
+Package: gl-tailscale-fix
+Version: {{VERSION}}
+Architecture: all
+Maintainer: RemoteToHome Consulting <https://remotetohome.io>
+Section: net
+Priority: optional
+Description: Tailscale enhancements for GL.iNet routers
+ Adds exit node advertisement, firewall kill switch, guest network
+ routing, and Tailscale version management to the GL admin panel.
+ https://remotetohome.io/gl-tailscale-fix

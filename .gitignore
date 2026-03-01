@@ -1,0 +1,5 @@
+# Build artifacts
+build/
+
+# Internal documentation (not published)
+docs/

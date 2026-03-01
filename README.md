@@ -1,0 +1,209 @@
+# gl-tailscale-fix
+
+Plugin package that fixes and enhances the Tailscale integration on GL.iNet routers. Adds missing
+features through GUI controls injected into the existing GL admin Tailscale page
+— without modifying any GL-owned files.
+
+**[Setup Guide & User Documentation](https://remotetohome.io/gl-tailscale-fix)**
+— screenshots, step-by-step exit node setup, kill switch verification, DNS configuration,
+Tailscale admin console walkthrough.
+
+![Tailscale Enhanced controls](.github/images/tailscale-enhanced.webp)
+
+## Features
+
+- **Routing Kill Switch** — policy routing rules that block LAN/guest→WAN
+  traffic at the kernel routing layer, before conntrack and firewall evaluation.
+  Prevents even established connections from leaking when the exit node drops.
+  Persists through daemon crashes, OOM kills, reboots, and service restarts.
+- **Advertise as Exit Node** — GUI toggle for `tailscale set
+  --advertise-exit-node`. No SSH or script modification required.
+- **Guest Network Access** — bidirectional firewall forwardings between guest
+  network (br-guest) and Tailscale interface (tailscale0), guest subnet route
+  advertisement, and policy route fixup that ensures guest clients can use exit
+  nodes and are covered by the kill switch.
+- **Tailscale Version Manager** — installed vs latest version display, one-click
+  update using space-optimized combined binaries, factory restore.
+- **Plugin Update Notification** — automatically checks GitHub for newer
+  gl-tailscale-fix releases and shows an update badge with download link in the
+  admin panel.
+- **Zero modification** — never touches GL-owned files. Clean install and removal.
+
+## Installation
+
+Download the latest `.ipk` from [Releases](https://github.com/RemoteToHome-io/gl-tailscale-fix/releases).
+
+```bash
+scp -O gl-tailscale-fix_*.ipk root@<router-ip>:/tmp/
+ssh root@<router-ip> opkg install /tmp/gl-tailscale-fix_*.ipk
+```
+
+> **Pre-install check:** If you previously modified `/usr/bin/gl_tailscale` to add
+> `--advertise-exit-node`, revert that change before installing. gl-tailscale-fix
+> manages exit node advertisement through its own mechanism.
+>
+> Check: `grep 'advertise-exit-node' /usr/bin/gl_tailscale`
+
+After installation, navigate to **APPLICATIONS → Tailscale** in the GL admin panel.
+Controls appear below GL's settings under a "Tailscale Enhanced" divider.
+
+For the full setup walkthrough — including exit node configuration, Tailscale admin
+console approval, DNS setup, and kill switch verification — see the
+**[setup guide](https://remotetohome.io/gl-tailscale-fix#setup-guide)**.
+
+## Uninstallation
+
+```bash
+ssh root@<router-ip> opkg remove gl-tailscale-fix
+```
+
+Clean removal — all injected UI, routing rules, firewall forwardings, and config
+files are removed.
+
+## Architecture
+
+Pure Lua, shell, and vanilla JavaScript — no compiled binaries. Single `.ipk`
+package under 50KB. Works as a non-invasive overlay — no GL.iNet scripts,
+binaries, or config files are modified. All integration uses standard OpenWrt
+interfaces (UCI, hotplug, procd, nginx includes) and GL's existing extension
+points. Install adds files; removal leaves the system exactly as it was.
+
+- **Backend**: Custom Lua RPC module (`ts-fix`) loaded by GL's OpenResty API
+  dispatcher. Own UCI config file `/etc/config/ts-fix` — never touches GL's
+  `/etc/config/tailscale`.
+- **Frontend**: Vanilla JS injected into GL's SPA via nginx
+  `body_filter_by_lua_file`. No frameworks, no build tools.
+- **Persistence**: Multiple mechanisms ensure settings survive GL's
+  `tailscale up --reset` and handle teardown when Tailscale is disabled:
+  1. **Hotplug** (priority 20, after GL's 19) — fires on network interface events,
+     re-applies settings after GL restart; also triggers teardown when TS disabled
+  2. **JS Apply hook** — fast-path re-apply when the admin page is open
+  3. **Watchdog daemon** — polls every 5s, detects TS disable (full teardown) and
+     exit node removal while kill switch is active (auto-disables KS)
+- **Kill switch**: Policy routing (`ip rule` + `ip route`) that catches
+  forwarded traffic at the routing layer — before conntrack and firewall
+  evaluation. Tailscale's exit node uses priority 5270 → table 52; the kill
+  switch inserts priority 5280 → table 100 (`unreachable default`). When the
+  exit node is active, traffic matches 5270 and never reaches our rule. When the
+  exit node drops, traffic falls through to 5280 and gets an ICMP unreachable.
+  Works on both fw3 (iptables) and fw4 (nftables) since it uses kernel routing,
+  not firewall-specific mechanisms. Router management (admin, SSH, DNS, Tailscale
+  control plane) and LAN-to-LAN traffic are unaffected (`iif br-lan`/`br-guest`
+  only matches forwarded traffic).
+
+  **Note:** The kill switch covers LAN/guest→WAN forwarding. If a competing VPN
+  client (WireGuard, OpenVPN, AmneziaWG) is running on the same VLAN, its
+  fwmark-based policy routing (typically priority 6000) intercepts traffic before
+  Tailscale's exit node routing (priority 5270). Don't run a VPN client tunnel on
+  the same network segment that routes through a Tailscale exit node.
+
+- **Guest routing**: Firewall forwardings (guest↔tailscale0) plus a policy route
+  fixup. When Tailscale advertises a subnet, it creates a source-based rule
+  (`from <subnet> lookup main`) at priority 0. For the primary LAN, Tailscale
+  uses destination-based (`to <subnet>`). The source-based rule catches all
+  guest-originated traffic and sends it to the main table → WAN, bypassing both
+  the exit node and kill switch. gl-tailscale-fix replaces this with a
+  destination-based rule, matching Tailscale's own LAN behavior. This is
+  re-applied after every Tailscale restart.
+
+### File layout
+
+```
+/usr/lib/oui-httpd/rpc/ts-fix              Lua RPC module (backend API)
+/etc/init.d/ts-fix                         Procd service (runs watchdog daemon)
+/etc/hotplug.d/iface/20-ts-fix             Hotplug script (ifup reapply + teardown)
+/usr/bin/ts-fix-reapply                    Shared reapply/teardown logic
+/usr/bin/ts-fix-watchdog                   Watchdog daemon (TS disable + exit node removal)
+/etc/nginx/gl-conf.d/ts-fix.conf           Nginx location + filter config
+/usr/share/ts-fix/ts-fix-body-filter.lua   Nginx body filter (script injection)
+/usr/share/ts-fix/ts-fix-header-filter.lua Nginx header filter (content-length)
+/usr/share/ts-fix/www/ts-fix.js.gz         Frontend JS (gzip_static)
+/usr/bin/ts-fix-update                     Tailscale updater script
+/etc/config/ts-fix.default                 UCI default config template
+/etc/config/ts-fix                         Active UCI config
+/lib/upgrade/keep.d/gl-tailscale-fix       Sysupgrade persistence list
+```
+
+## Building from source
+
+Requires standard Linux tools (tar, gzip, install). No OpenWrt SDK needed.
+
+```bash
+./pkg/build.sh 1.0.11
+# Output: build/out/gl-tailscale-fix_1.0.11_all.ipk
+```
+
+## Compatibility
+
+**Should work** on any GL.iNet router with native Tailscale support running
+firmware 4.6.x - 4.8.x (tested on 4.6.8 through 4.8.5). Both fw3 (iptables) and
+fw4 (nftables) are supported — the kill switch uses kernel routing (not
+firewall-specific), guest forwardings use GL's UCI abstraction layer.
+
+> **⚠️ Not yet tested with firmware 4.9.x or later.** GL has made changes to the
+> Tailscale integration and admin GUI in the 4.9.x series. Do not install on
+> 4.9.x firmware until compatibility has been verified — check
+> [Releases](https://github.com/RemoteToHome-io/gl-tailscale-fix/releases) for
+> updates.
+
+See the [tested models](#tested-models) appendix for the full compatibility matrix.
+
+## Disclaimer
+
+**No warranty**.  The GL.iNet Tailscale implementation is Beta software and subject
+to change without notice (including for us).  While we have put extensive effort into
+testing, this functionality should also be considered beta and we cannot anticipate
+how future GL firmware changes may impact functionality of this plugin.  We recommend
+checking here for the latest plugin release before upgrading your GL firmware.
+**Use at your own risk** and refer to the testing methodology in our
+[User Documentation](https://remotetohome.io/gl-tailscale-fix) to personally verify
+your privacy posture before using in production.
+
+## Contributing
+
+Found a bug? Have a feature request? Tested on a new router model?
+
+- **Bug reports and feature requests**:
+  [Open an issue](https://github.com/RemoteToHome-io/gl-tailscale-fix/issues)
+- **Pull requests**: Welcome. The plugin is pure Lua, shell, and vanilla JS — no
+  build toolchain required. See [Architecture](#architecture) for how the pieces
+  fit together.
+- **Model testing**: If you verify gl-tailscale-fix on a GL.iNet model not in the
+  [tested models](#tested-models) table, please open an issue with your model,
+  firmware version, and test results.
+
+## Attribution
+
+- Tailscale combined binaries from [glinet-tailscale-updater](https://github.com/Admonstrator/glinet-tailscale-updater) by @Admonstrator
+- [TheWiredNomad](https://thewirednomad.com/) for feedback and testing
+- Beta testers and feedback from the GL.iNet community
+- Claude for hashing out the Lua/frontend, readme docs and code reviews
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE).
+
+Commercial licensing available for closed source use — contact [remotetohome.io/contact](https://remotetohome.io/contact/).
+
+## Appendix
+
+### Tested Models
+
+| Model | Device | FW | OpenWrt | Firewall | Plugin | Tailscale |
+|-------|--------|----|--------|----------|--------|-----------|
+| GL-AXT1800 | Slate AX | 4.8.2 | 23.05 | fw4 | v1.0.11 | 1.80.3 / 1.94.2 |
+| GL-MT3000 | Beryl AX | 4.8.2β | 21.02 | fw3 | v1.0.11 | 1.80.3 / 1.94.2 |
+| GL-AX1800 | Flint | 4.6.8 | 21.02 | fw3 | v1.0.5 † | 1.66.4 |
+| GL-MT2500 | Brume 2 | 4.7.4 | 21.02 | fw3 | v1.0.5 † | 1.66.4 |
+| GL-MT6000 | Flint 2 | 4.8.3 | 21.02 | fw3 | v1.0.5 † | 1.80.3 |
+| GL-BE3600 | Slate 7 | 4.8.1 | 23.05 | fw4 | v1.0.5 † | 1.80.3 |
+| GL-BE6500 | Flint 3 | 4.8.4 | 23.05 | fw4 | v1.0.5 † | 1.92.5 |
+| GL-MT3600BE | Beryl 7 | 4.8.5 | 21.02 | fw3 | v1.0.5 † | 1.80.3 |
+
+**†** Install/remove verified only (Tailscale not connected — feature testing pending).
+
+All features verified on AXT1800 and MT3000 with both factory (v1.80.3) and
+updated (v1.94.2) Tailscale binaries: exit node advertisement, routing kill
+switch, guest network routing, version manager (update + restore).
+All other models verified for install/remove lifecycle, nginx injection, RPC module
+loading, and UCI config management.
