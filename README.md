@@ -149,8 +149,8 @@ leaves the system exactly as it was.
 Requires standard Linux tools (tar, gzip, install). No OpenWrt SDK needed.
 
 ```bash
-./pkg/build.sh 1.0.12
-# Output: build/out/gl-tailscale-fix_1.0.12_all.ipk
+./pkg/build.sh 1.0.13
+# Output: build/out/gl-tailscale-fix_1.0.13_all.ipk
 ```
 
 ## Compatibility
@@ -211,14 +211,14 @@ Commercial licensing available for closed source use — contact [remotetohome.i
 
 | Model | Device | FW | OpenWrt | Firewall | Plugin | Tailscale |
 |-------|--------|----|--------|----------|--------|-----------|
-| GL-AXT1800 | Slate AX | 4.8.2 | 23.05 | fw4 | v1.0.12 | 1.80.3 / 1.94.2 |
-| GL-MT3000 | Beryl AX | 4.8.2β | 21.02 | fw3 | v1.0.12 | 1.80.3 / 1.94.2 |
+| GL-AXT1800 | Slate AX | 4.8.2 | 23.05 | fw4 | v1.0.13 | 1.80.3 / 1.94.2 |
+| GL-MT3000 | Beryl AX | 4.8.2β | 21.02 | fw3 | v1.0.13 | 1.80.3 / 1.94.2 |
 | GL-AX1800 | Flint | 4.6.8 | 21.02 | fw3 | v1.0.5 † | 1.66.4 |
 | GL-MT2500 | Brume 2 | 4.7.4 | 21.02 | fw3 | v1.0.5 † | 1.66.4 |
 | GL-MT6000 | Flint 2 | 4.8.3 | 21.02 | fw3 | v1.0.5 † | 1.80.3 |
 | GL-BE3600 | Slate 7 | 4.8.1 | 23.05 | fw4 | v1.0.5 † | 1.80.3 |
 | GL-BE6500 | Flint 3 | 4.8.4 | 23.05 | fw4 | v1.0.5 † | 1.92.5 |
-| GL-MT3600BE | Beryl 7 | 4.8.5 | 21.02 | fw3 | v1.0.12 ‡ | 1.80.3 |
+| GL-MT3600BE | Beryl 7 | 4.8.5 | 21.02 | fw3 | v1.0.13 ‡ | 1.80.3 |
 
 **†** Install/remove verified only (Tailscale not connected — feature testing pending).
 **‡** Community-verified (full functionality reported).
