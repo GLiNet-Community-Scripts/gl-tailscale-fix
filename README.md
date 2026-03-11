@@ -218,10 +218,10 @@ Commercial licensing available for closed source use — contact [remotetohome.i
 | GL-MT6000 | Flint 2 | 4.8.3 | 21.02 | fw3 | v1.0.5 † | 1.80.3 |
 | GL-BE3600 | Slate 7 | 4.8.1 | 23.05 | fw4 | v1.0.5 † | 1.80.3 |
 | GL-BE6500 | Flint 3 | 4.8.4 | 23.05 | fw4 | v1.0.5 † | 1.92.5 |
-| GL-MT3600BE | Beryl 7 | 4.8.5 | 21.02 | fw3 | v1.0.13 ‡ | 1.80.3 |
+| GL-MT3600BE | Beryl 7 | 4.8.5 | 21.02 | fw3 | v1.0.13 ‡ | 1.94.2 |
 
 **†** Install/remove verified only (Tailscale not connected — feature testing pending).
-**‡** Community-verified (full functionality reported).
+**‡** Community-verified: install/remove, UI injection, kill switch, guest routing ([#1](https://github.com/RemoteToHome-io/gl-tailscale-fix/issues/1)).
 
 All features verified on AXT1800 and MT3000 with both factory (v1.80.3) and
 updated (v1.94.2) Tailscale binaries: exit node advertisement, routing kill
