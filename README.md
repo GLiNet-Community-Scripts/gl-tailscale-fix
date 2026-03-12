@@ -40,6 +40,23 @@ Tailscale admin console walkthrough.
 
 Download the latest `.ipk` from [Releases](https://github.com/RemoteToHome-io/gl-tailscale-fix/releases).
 
+### One-command installer for quick CLI installation
+
+```sh
+wget -q https://github.com/RemoteToHome-io/gl-tailscale-fix/releases/latest/download/install-gl-tailscale-fix.sh -O install-gl-tailscale-fix.sh ; sh install-gl-tailscale-fix.sh
+```
+
+Stable installer script URL:
+
+```text
+https://github.com/RemoteToHome-io/gl-tailscale-fix/releases/latest/download/install-gl-tailscale-fix.sh
+```
+
+The installer script downloads the latest `.ipk`, verifies it against the
+published `sha256` file, and only then runs `opkg install`.
+
+### Manual installation
+
 ```bash
 scp -O gl-tailscale-fix_*.ipk root@<router-ip>:/tmp/
 ssh root@<router-ip> opkg install /tmp/gl-tailscale-fix_*.ipk
