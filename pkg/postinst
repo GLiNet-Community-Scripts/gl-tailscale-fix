@@ -12,6 +12,15 @@ elif [ ! -f /etc/config/ts-fix ]; then
     cp /etc/config/ts-fix.default /etc/config/ts-fix
 fi
 
+# Restore original GL wrapper if it was modified (e.g., users who manually
+# added --advertise-exit-node before the plugin existed). The plugin handles
+# exit node natively, so the manual modification must be reverted to prevent
+# conflicts. This runs here (not just in the installer script) so it applies
+# regardless of installation method (LuCI upload, manual opkg, or installer).
+if [ -f '/rom/usr/bin/gl_tailscale' ] && ! cmp -s '/rom/usr/bin/gl_tailscale' '/usr/bin/gl_tailscale'; then
+    cp '/rom/usr/bin/gl_tailscale' '/usr/bin/gl_tailscale' 2>/dev/null || true
+fi
+
 # Ensure tailscale CLI symlink exists (combined binary installs only have
 # tailscaled; the symlink may be missing after sysupgrade or manual cleanup)
 if [ -f /usr/sbin/tailscaled ] && [ ! -e /usr/sbin/tailscale ]; then

@@ -15,6 +15,13 @@ local TS_FIX_CONFIG = "ts-fix"
 local FW_CONFIG = "firewall"
 local TS_CONFIG = "tailscale"
 
+-- Version check cache TTL (72 hours)
+local CACHE_TTL = 259200
+
+-- Cached tailscale version (doesn't change between refreshes; only changes
+-- after update/restore which restarts nginx, clearing the module cache)
+local cached_ts_version = nil
+
 -- Helper: strip version suffix (e.g. "1.94.2-tiny.by.admon.1187" → "1.94.2")
 local function base_ver(v)
     if v then return v:match("^([%d%.]+)") end
@@ -32,6 +39,21 @@ local function exec(cmd)
     return nil
 end
 
+-- Helper: check if a cache file is stale (older than CACHE_TTL seconds)
+-- Uses "date -r" (BusyBox) since GL routers don't have stat in PATH.
+-- Array-form spawn avoids shell interpolation of path.
+local function is_cache_stale(path)
+    if not fs.access(path) then return true end
+    local r = ngx.pipe.spawn({"date", "-r", path, "+%s"})
+    if not r then return true end
+    local mtime_str = r:stdout_read_all()
+    r:wait()
+    if not mtime_str then return true end
+    local mtime = tonumber(mtime_str:match("^(%d+)"))
+    if not mtime then return true end
+    return (ngx.time() - mtime) >= CACHE_TTL
+end
+
 -- Helper: run a command and return exit code
 local function exec_rc(cmd)
     local r = ngx.pipe.spawn({"sh", "-c", cmd})
@@ -45,7 +67,14 @@ local function exec_rc(cmd)
 end
 
 -- Helper: get tailscale status JSON
+-- Guards with pgrep first — if tailscaled isn't running, returns nil
+-- immediately instead of spawning a ~60MB Go process that hangs for 3s
+-- until timeout. Prevents OOM amplification loops on 512MB routers where
+-- dead tailscaled + piling CLI processes exhaust all memory.
 local function tailscale_status()
+    if exec_rc("pgrep -x tailscaled >/dev/null 2>&1") ~= 0 then
+        return nil
+    end
     local data = exec("timeout 3 /usr/sbin/tailscale status --json 2>/dev/null")
     if data and #data > 0 then
         local ok, r = pcall(cjson.decode, data)
@@ -231,25 +260,32 @@ function M.get_config()
     res.wan_enabled = c:get(TS_CONFIG, "settings", "wan_enabled") == "1"
     res.exit_node_ip = c:get(TS_CONFIG, "settings", "exit_node_ip") or ""
 
-    -- Live tailscale state
-    local status = tailscale_status()
-    if status then
-        res.ts_running = status.BackendState == "Running"
-        if status.Self then
-            res.exit_node_active = status.Self.ExitNodeOption == true
+    -- Skip heavy tailscale CLI calls when TS is disabled (saves ~15MB RSS
+    -- per call on 512MB routers where every MB counts against OOM)
+    if res.ts_enabled then
+        -- Live tailscale state
+        local status = tailscale_status()
+        if status then
+            res.ts_running = status.BackendState == "Running"
+            if status.Self then
+                res.exit_node_active = status.Self.ExitNodeOption == true
+            end
+        else
+            res.ts_running = false
+            res.exit_node_active = false
         end
     else
         res.ts_running = false
         res.exit_node_active = false
     end
 
-    -- Installed version (strip suffix from combined builds)
-    local ver = exec("/usr/sbin/tailscale version 2>/dev/null")
-    if ver then
-        res.ts_version = base_ver(ver:match("^(%S+)")) or "unknown"
-    else
-        res.ts_version = "unknown"
+    -- Installed version (cached — only changes after update/restore which
+    -- restarts nginx, clearing the module-level cache)
+    if not cached_ts_version then
+        local ver = exec("/usr/sbin/tailscale version 2>/dev/null")
+        cached_ts_version = ver and base_ver(ver:match("^(%S+)")) or "unknown"
     end
+    res.ts_version = cached_ts_version
 
     -- Kill switch routing rule state (ip rules for table 100 at priority 5280)
     local ks_rules = exec("ip rule list priority 5280 2>/dev/null") or ""
@@ -349,11 +385,14 @@ end
 function M.get_update_info()
     local res = {}
 
-    -- Installed version (strip suffix from combined builds)
-    local ver = exec("/usr/sbin/tailscale version 2>/dev/null")
-    res.installed_version = ver and base_ver(ver:match("^(%S+)")) or "unknown"
+    -- Installed version (cached — see get_config)
+    if not cached_ts_version then
+        local ver = exec("/usr/sbin/tailscale version 2>/dev/null")
+        cached_ts_version = ver and base_ver(ver:match("^(%S+)")) or "unknown"
+    end
+    res.installed_version = cached_ts_version
 
-    -- Architecture
+    -- Architecture (hardcoded after first call — doesn't change at runtime)
     local arch = exec("uname -m 2>/dev/null")
     res.arch = arch and arch:match("^(%S+)") or "unknown"
 
@@ -365,8 +404,12 @@ function M.get_update_info()
             res.latest_version = f:read("*l") or "unknown"
             f:close()
         end
+        -- Background refresh if cache is stale (returns cached value, no UI flash)
+        if is_cache_stale(cache_file) then
+            ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--check"})
+        end
     else
-        -- Trigger async version check
+        -- No cache — trigger async version check
         ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--check"})
         res.latest_version = "checking..."
     end
@@ -395,6 +438,9 @@ function M.do_update()
     if fs.access("/tmp/ts-fix-update.lock") then
         return { err_code = -1, err_msg = "Update already in progress" }
     end
+
+    -- Clear cached version (binary will change)
+    cached_ts_version = nil
 
     -- Launch update in background
     ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--install"})
@@ -438,6 +484,9 @@ function M.do_restore()
         return { err_code = -1, err_msg = "Factory binaries not found in /rom/" }
     end
 
+    -- Clear cached version (binary will change)
+    cached_ts_version = nil
+
     ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--restore"})
     return { status = "restore_started" }
 end
@@ -471,14 +520,29 @@ function M.get_plugin_info()
             res.latest_version = "unavailable"
             res.release_url = ""
         end
+        -- Background refresh if cache is stale (returns cached value, no UI flash)
+        if is_cache_stale(cache_file) then
+            ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--check-plugin"})
+        end
     else
-        -- Trigger async version check
+        -- No cache — trigger async version check
         ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--check-plugin"})
         res.latest_version = "checking..."
         res.release_url = ""
     end
 
     return res
+end
+
+--[[
+    @method-type: call
+    @method-name: force_check_versions
+    @method-desc: Force re-check of both Tailscale and plugin versions (clears cache)
+--]]
+function M.force_check_versions()
+    ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--check"})
+    ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--check-plugin"})
+    return {}
 end
 
 return M

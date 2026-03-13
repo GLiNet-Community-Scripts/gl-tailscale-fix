@@ -23,6 +23,21 @@ if [ "$enabled" != "1" ]; then
     _gs=$(ip -4 addr show br-guest 2>/dev/null | awk '/inet /{print $2}' | sed 's|\.[0-9]*/|.0/|')
     [ -n "$_gs" ] && ip rule del to "$_gs" table main 2>/dev/null
 
+    # Remove guest subnet from advertised routes
+    if [ -n "$_gs" ]; then
+        _cur=$(/usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.AdvertiseRoutes[*]' 2>/dev/null | tr '\n' ',')
+        case ",$_cur," in
+            *",$_gs,"*)
+                _new=$(echo "$_cur" | sed "s/${_gs},//;s/,${_gs}//;s/^${_gs}$//;s/,$//" )
+                if [ -n "$_new" ]; then
+                    /usr/sbin/tailscale set --advertise-routes="$_new" 2>/dev/null
+                else
+                    /usr/sbin/tailscale set --advertise-routes= 2>/dev/null
+                fi
+                ;;
+        esac
+    fi
+
     # Remove legacy UCI firewall kill switch rules (pre-v1.0.9)
     for section in ts_ks_lan2wan ts_ks_guest2wan; do
         uci -q delete firewall.$section 2>/dev/null
@@ -92,9 +107,8 @@ fi
 
 # Re-apply guest subnet route advertisement
 route_guest=$(uci -q get ts-fix.settings.route_guest)
+guest_subnet=$(ip -4 addr show br-guest 2>/dev/null | awk '/inet /{print $2}' | sed 's|\.[0-9]*/|.0/|')
 if [ "$route_guest" = "1" ]; then
-    # Get guest subnet from br-guest interface
-    guest_subnet=$(ip -4 addr show br-guest 2>/dev/null | awk '/inet /{print $2}' | sed 's|\.[0-9]*/|.0/|')
     if [ -n "$guest_subnet" ]; then
         # Get current routes, add guest subnet if missing
         current=$(/usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.AdvertiseRoutes[*]' 2>/dev/null | tr '\n' ',')
@@ -102,9 +116,23 @@ if [ "$route_guest" = "1" ]; then
             *",$guest_subnet,"*) ;; # already present
             *)
                 new_routes="${current}${guest_subnet}"
-                # Remove trailing comma
                 new_routes=$(echo "$new_routes" | sed 's/,$//')
                 /usr/sbin/tailscale set --advertise-routes="$new_routes" 2>/dev/null
+                ;;
+        esac
+    fi
+else
+    # Remove guest subnet from advertised routes if present
+    if [ -n "$guest_subnet" ]; then
+        current=$(/usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.AdvertiseRoutes[*]' 2>/dev/null | tr '\n' ',')
+        case ",$current," in
+            *",$guest_subnet,"*)
+                new_routes=$(echo "$current" | sed "s/${guest_subnet},//;s/,${guest_subnet}//;s/^${guest_subnet}$//;s/,$//" )
+                if [ -n "$new_routes" ]; then
+                    /usr/sbin/tailscale set --advertise-routes="$new_routes" 2>/dev/null
+                else
+                    /usr/sbin/tailscale set --advertise-routes= 2>/dev/null
+                fi
                 ;;
         esac
     fi
@@ -127,9 +155,11 @@ else
     }
 fi
 
-# Sync guest routing firewall forwardings
+# Sync firewall state (batched — single commit + reload at end)
+_fw_dirty=0
+
+# Guest routing firewall forwardings
 if [ "$route_guest" = "1" ]; then
-    # Ensure guest<->tailscale forwardings exist
     if [ -z "$(uci -q get firewall.ts_fix_guest2ts)" ]; then
         uci set firewall.ts_fix_guest2ts=forwarding
         uci set firewall.ts_fix_guest2ts.src=guest
@@ -137,16 +167,13 @@ if [ "$route_guest" = "1" ]; then
         uci set firewall.ts_fix_ts2guest=forwarding
         uci set firewall.ts_fix_ts2guest.src=tailscale0
         uci set firewall.ts_fix_ts2guest.dest=guest
-        uci commit firewall
-        /etc/init.d/firewall reload
+        _fw_dirty=1
     fi
 else
-    # Remove guest<->tailscale forwardings if they exist
     if [ -n "$(uci -q get firewall.ts_fix_guest2ts)" ]; then
         uci -q delete firewall.ts_fix_guest2ts
         uci -q delete firewall.ts_fix_ts2guest
-        uci commit firewall
-        /etc/init.d/firewall reload
+        _fw_dirty=1
     fi
 fi
 
@@ -156,19 +183,19 @@ fi
 if [ -n "$(uci -q get firewall.tailscale0)" ]; then
     if [ "$(uci -q get firewall.tailscale0.masq)" != "1" ]; then
         uci set firewall.tailscale0.masq=1
-        uci commit firewall
-        /etc/init.d/firewall reload
+        _fw_dirty=1
     fi
 fi
 
 # Migration: remove legacy UCI firewall kill switch rules (pre-v1.0.9)
-_legacy=0
 for section in ts_ks_lan2wan ts_ks_guest2wan; do
     [ -n "$(uci -q get firewall.$section)" ] && {
-        uci -q delete firewall.$section; _legacy=1
+        uci -q delete firewall.$section; _fw_dirty=1
     }
 done
-[ "$_legacy" = "1" ] && { uci commit firewall; /etc/init.d/firewall reload; }
+
+# Single firewall commit + reload for all accumulated changes
+[ "$_fw_dirty" = "1" ] && { uci commit firewall; /etc/init.d/firewall reload; }
 
 # Sync kill switch routing rules (ip rule + ip route)
 # Uses policy routing instead of firewall rules to block before conntrack.
@@ -185,7 +212,14 @@ exit_node_id=$(/usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.Ex
 # kill switch is active — without this, the KS routing rules remain active
 # but the KS toggle disappears from the UI (hidden when no exit node),
 # blocking all LAN/guest traffic with no way to turn it off.
-if [ "$kill_switch" = "1" ] && [ -z "$exit_node_id" ]; then
+#
+# IMPORTANT: ExitNodeID is transiently empty during gl_tailscale restart
+# (tailscale up --reset clears it, then re-applies). If GL's UCI still has
+# an exit_node_ip configured, we're in a restart transient — do NOT auto-
+# disable. The watchdog handles the deliberate removal case (GL clears the
+# exit node via tailscale set --exit-node= but leaves UCI stale).
+gl_exit_ip=$(uci -q get tailscale.settings.exit_node_ip)
+if [ "$kill_switch" = "1" ] && [ -z "$exit_node_id" ] && [ -z "$gl_exit_ip" ]; then
     uci -q set ts-fix.settings.kill_switch=0
     uci commit ts-fix
     kill_switch="0"

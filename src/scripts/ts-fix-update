@@ -84,12 +84,8 @@ do_check_plugin() {
 # -- Install mode: download and install latest Tailscale --
 
 do_install() {
-    # Lock
-    if [ -f "$LOCK" ]; then
-        echo "Update already running"
-        exit 1
-    fi
-    echo $$ > "$LOCK"
+    exec 200>"$LOCK"
+    flock -n 200 || { echo "Update already running"; exit 1; }
     trap cleanup EXIT
 
     set_status "running" "Detecting architecture..."
@@ -197,11 +193,8 @@ do_install() {
 # -- Restore mode: restore factory binaries --
 
 do_restore() {
-    if [ -f "$LOCK" ]; then
-        echo "Operation already running"
-        exit 1
-    fi
-    echo $$ > "$LOCK"
+    exec 200>"$LOCK"
+    flock -n 200 || { echo "Operation already running"; exit 1; }
     trap cleanup EXIT
 
     set_status "running" "Restoring factory binaries..."

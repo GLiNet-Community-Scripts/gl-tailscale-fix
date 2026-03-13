@@ -25,16 +25,27 @@ while true; do
     # GL does not notify us when Custom Exit Node is disabled — it clears
     # the exit node in tailscale but leaves its own UCI stale. Without this
     # check, KS routing rules blackhole all traffic indefinitely.
+    #
+    # Memory optimization: first check uses kernel routing queries (ip rule
+    # + ip route = zero RSS). Only spawns Go tailscale CLI processes (~10MB
+    # RSS each) when the light check detects a potential problem. This
+    # prevents OOM on 512MB routers where the previous approach spawned
+    # 2 Go processes every 5s poll cycle.
     if [ "$curr" = "1" ]; then
         ks=$(uci -q get ts-fix.settings.kill_switch)
-        if [ "$ks" = "1" ]; then
-            exit_id=$(/usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.ExitNodeID' 2>/dev/null)
-            if [ -z "$exit_id" ]; then
-                # Confirm tailscale is Running (not mid-restart where prefs are transiently empty)
-                state=$(/usr/sbin/tailscale status --json 2>/dev/null | jsonfilter -e '@.BackendState' 2>/dev/null)
-                if [ "$state" = "Running" ]; then
-                    logger -t ts-fix "Exit node removed while kill switch active — auto-disabling"
-                    /usr/bin/ts-fix-reapply
+        if [ "$ks" = "1" ] && ip rule list priority 5280 2>/dev/null | grep -q "lookup 100"; then
+            # Light check: Tailscale's exit node uses table 52 with a default route.
+            # If table 52 has no default, exit node routing is gone.
+            if ! ip route show table 52 2>/dev/null | grep -q "default"; then
+                # Heavy check: confirm via tailscale prefs (authoritative)
+                exit_id=$(/usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.ExitNodeID' 2>/dev/null)
+                if [ -z "$exit_id" ]; then
+                    # Confirm tailscale is Running (not mid-restart where prefs are transiently empty)
+                    state=$(/usr/sbin/tailscale status --json 2>/dev/null | jsonfilter -e '@.BackendState' 2>/dev/null)
+                    if [ "$state" = "Running" ]; then
+                        logger -t ts-fix "Exit node removed while kill switch active — auto-disabling"
+                        /usr/bin/ts-fix-reapply
+                    fi
                 fi
             fi
         fi

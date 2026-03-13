@@ -37,17 +37,19 @@ Tailscale admin console walkthrough.
 
 - **Plugin Update Notification** — automatically checks GitHub for newer
   gl-tailscale-fix releases and shows an update badge with download link in the
-  admin panel.
+  admin panel. Version caches expire after 72 hours; a ↻ button provides
+  on-demand refresh.
 - **Subnet Routing Fix** — automatically enables masquerade on the tailscale0
   firewall zone. Tailscale's built-in SNAT can fail to reinitialize after daemon
   restart, particularly on fw3 (iptables) kernels, causing cross-subnet LAN
   traffic from client devices to break. The masquerade provides defense-in-depth
   SNAT at the firewall layer. Applied automatically — no user action required.
 - **Clean integration** — no GL scripts or binaries are altered from their
-  factory state. If the installer detects a user-modified `gl_tailscale`
-  wrapper (e.g. a manual `--advertise-exit-node` modification), it restores
-  the original from ROM to prevent conflicts — the plugin handles exit node
-  natively. All integration
+  factory state. If a modified `gl_tailscale` wrapper is detected during
+  installation (e.g. a manual `--advertise-exit-node` modification), the
+  original is automatically restored from ROM to prevent conflicts — the
+  plugin handles exit node natively. This applies to all installation
+  methods (SSH installer, manual opkg, or LuCI upload). All integration
   through standard OpenWrt interfaces (UCI, hotplug, procd, nginx includes).
   Clean install and removal.
 
@@ -123,8 +125,10 @@ as it was.
   1. **Hotplug** (priority 20, after GL's 19) — fires on network interface events,
      re-applies settings after GL restart; also triggers teardown when TS disabled
   2. **JS Apply hook** — fast-path re-apply when the admin page is open
-  3. **Watchdog daemon** — polls every 5s, detects TS disable (full teardown) and
-     exit node removal while kill switch is active (auto-disables KS)
+  3. **Watchdog daemon** — polls every 5s using lightweight kernel routing queries
+     (`ip rule`/`ip route`), detects TS disable (full teardown) and exit node
+     removal while kill switch is active (auto-disables KS). Heavy tailscale CLI
+     calls are only spawned when the light check detects a potential problem.
 - **Kill switch**: Policy routing (`ip rule` + `ip route`) that catches
   forwarded traffic at the routing layer — before conntrack and firewall
   evaluation. Tailscale's exit node uses priority 5270 → table 52; the kill
@@ -185,8 +189,8 @@ as it was.
 Requires standard Linux tools (tar, gzip, install). No OpenWrt SDK needed.
 
 ```bash
-./pkg/build.sh 1.0.13
-# Output: build/out/gl-tailscale-fix_1.0.13_all.ipk
+./pkg/build.sh 1.0.15
+# Output: build/out/gl-tailscale-fix_1.0.15_all.ipk
 ```
 
 ## Compatibility
@@ -247,8 +251,8 @@ Commercial licensing available for closed source use — contact [remotetohome.i
 
 | Model | Device | FW | OpenWrt | Firewall | Plugin | Tailscale |
 |-------|--------|----|--------|----------|--------|-----------|
-| GL-AXT1800 | Slate AX | 4.8.2 | 23.05 | fw4 | v1.0.13 | 1.80.3 / 1.94.2 |
-| GL-MT3000 | Beryl AX | 4.8.2β | 21.02 | fw3 | v1.0.13 | 1.80.3 / 1.94.2 |
+| GL-AXT1800 | Slate AX | 4.8.2 | 23.05 | fw4 | v1.0.15 | 1.80.3 / 1.94.2 |
+| GL-MT3000 | Beryl AX | 4.8.2β | 21.02 | fw3 | v1.0.15 | 1.80.3 / 1.94.2 |
 | GL-AX1800 | Flint | 4.6.8 | 21.02 | fw3 | v1.0.5 † | 1.66.4 |
 | GL-MT2500 | Brume 2 | 4.7.4 | 21.02 | fw3 | v1.0.5 † | 1.66.4 |
 | GL-MT6000 | Flint 2 | 4.8.3 | 21.02 | fw3 | v1.0.5 † | 1.80.3 |
@@ -261,6 +265,7 @@ Commercial licensing available for closed source use — contact [remotetohome.i
 
 All features verified on AXT1800 and MT3000 with both factory (v1.80.3) and
 updated (v1.94.2) Tailscale binaries: exit node advertisement, routing kill
-switch, guest network routing, version manager (update + restore).
+switch, guest network routing, version manager (update + restore), OOM
+prevention on 512MB models.
 All other models verified for install/remove lifecycle, nginx injection, RPC module
 loading, and UCI config management.

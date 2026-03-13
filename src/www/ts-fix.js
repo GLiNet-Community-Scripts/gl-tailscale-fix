@@ -203,6 +203,20 @@ function injectStyles() {
     '.ts-fix-dark .ts-fix-footer { color: #606266; }',
     '.ts-fix-dark .ts-fix-badge { color: #606266; }',
     '.ts-fix-dark .ts-fix-status { color: #606266; }',
+    '',
+    '/* Refresh button */',
+    '.ts-fix-refresh-btn {',
+    '  display: inline-flex; align-items: center; justify-content: center;',
+    '  width: 18px; height: 18px; border: none; background: transparent;',
+    '  color: #a0a0a3; cursor: pointer; padding: 0; margin-left: 6px;',
+    '  font-size: 14px; line-height: 1; vertical-align: middle;',
+    '  transition: color 0.15s;',
+    '}',
+    '.ts-fix-refresh-btn:hover { color: #5272f7; }',
+    '.ts-fix-refresh-btn.is-spinning { animation: ts-fix-spin 0.8s linear infinite; }',
+    '@keyframes ts-fix-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }',
+    '.ts-fix-dark .ts-fix-refresh-btn { color: #606266; }',
+    '.ts-fix-dark .ts-fix-refresh-btn:hover { color: #5272f7; }',
   ].join('\n');
   document.head.appendChild(style);
 }
@@ -285,7 +299,22 @@ function buildSection() {
   // Divider
   var divider = document.createElement('div');
   divider.className = 'ts-fix-divider';
-  divider.innerHTML = '<span>Tailscale Enhanced</span><span class="ts-fix-badge">gl-tailscale-fix v' + VERSION + '</span>';
+  var divLabel = document.createElement('span');
+  divLabel.textContent = 'Tailscale Enhanced';
+  divider.appendChild(divLabel);
+  var badgeWrap = document.createElement('span');
+  badgeWrap.style.cssText = 'display:inline-flex;align-items:center;';
+  var badge = document.createElement('span');
+  badge.className = 'ts-fix-badge';
+  badge.textContent = 'gl-tailscale-fix v' + VERSION;
+  badgeWrap.appendChild(badge);
+  var refreshBtn = document.createElement('button');
+  refreshBtn.className = 'ts-fix-refresh-btn';
+  refreshBtn.title = 'Check for updates';
+  refreshBtn.innerHTML = '&#x21bb;';
+  refreshBtn.onclick = doRefreshVersions;
+  badgeWrap.appendChild(refreshBtn);
+  divider.appendChild(badgeWrap);
   section.appendChild(divider);
 
   // Allow Remote Access Guest (extends native GL function)
@@ -630,7 +659,9 @@ function pollUpdateStatus() {
       setTimeout(function() { fetchConfig(); fetchUpdateInfo(); }, 1000);
     }
   }).catch(function() {
-    setTimeout(pollUpdateStatus, POLL_MS);
+    if (window.location.hash.indexOf(ROUTE) === 0) {
+      setTimeout(pollUpdateStatus, POLL_MS);
+    }
   });
 }
 
@@ -646,6 +677,23 @@ function doRestore() {
     pollUpdateStatus();
   }).catch(function(e) {
     alert('Restore failed: ' + e.message);
+  });
+}
+
+function doRefreshVersions() {
+  var btn = document.querySelector('.ts-fix-refresh-btn');
+  if (!btn || btn.classList.contains('is-spinning')) return;
+  btn.classList.add('is-spinning');
+  rpc('ts-fix', 'force_check_versions', {}).then(function() {
+    fetchUpdateInfo();
+    fetchPluginInfo();
+    setTimeout(function() {
+      var b = document.querySelector('.ts-fix-refresh-btn');
+      if (b) b.classList.remove('is-spinning');
+    }, 1500);
+  }).catch(function() {
+    var b = document.querySelector('.ts-fix-refresh-btn');
+    if (b) b.classList.remove('is-spinning');
   });
 }
 

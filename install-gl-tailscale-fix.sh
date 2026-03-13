@@ -16,12 +16,12 @@ download_file() {
 
     if command -v wget >/dev/null 2>&1; then
         wget -q "$src" -O "$dst"
-        return 0
+        return $?
     fi
 
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL "$src" -o "$dst"
-        return 0
+        return $?
     fi
 
     echo "Error: neither wget nor curl is available." >&2
@@ -34,7 +34,7 @@ verify_checksum() {
             cd "${TMP_DIR}"
             sha256sum -c "${SHA_NAME}"
         )
-        return 0
+        return $?
     fi
 
     if command -v openssl >/dev/null 2>&1; then
