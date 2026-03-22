@@ -247,6 +247,11 @@ end
     @out bool   route_guest_fw_active  Whether guest→tailscale forwardings are currently active
 --]]
 function M.get_config()
+    -- Ensure masquerade on every config read (covers first page visit after
+    -- install, even if no ts-fix features are active — needed for LAN clients
+    -- to reach Tailscale peers through subnet routing)
+    ensure_masquerade()
+
     local c = uci.cursor()
     local res = {}
 

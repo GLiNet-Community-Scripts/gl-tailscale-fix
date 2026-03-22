@@ -75,6 +75,25 @@ LOCK="/tmp/ts-fix-reapply.lock"
 exec 200>"$LOCK"
 flock -n 200 || exit 0
 
+# Ensure tailscale0 zone masquerade BEFORE waiting for tailscaled — this is a
+# pure firewall setting that doesn't need the daemon. Required for LAN clients
+# to reach Tailscale peers through subnet routing (SNAT return path).
+if [ -n "$(uci -q get firewall.tailscale0)" ]; then
+    if [ "$(uci -q get firewall.tailscale0.masq)" != "1" ]; then
+        uci set firewall.tailscale0.masq=1
+        uci commit firewall
+        /etc/init.d/firewall reload >/dev/null 2>&1
+    fi
+fi
+
+# Migration: remove legacy UCI firewall kill switch rules (pre-v1.0.9)
+for section in ts_ks_lan2wan ts_ks_guest2wan; do
+    [ -n "$(uci -q get firewall.$section)" ] && {
+        uci -q delete firewall.$section
+        uci commit firewall
+    }
+done
+
 # GL's 19-tailscale-iface calls "gl_tailscale restart &" (async).
 # That script does: tailscale restart -> network setup -> tailscale up --reset.
 # We MUST wait for gl_tailscale to finish, otherwise --reset clears our settings.
@@ -184,24 +203,7 @@ else
     fi
 fi
 
-# Ensure tailscale0 zone masquerade (defense-in-depth for cross-subnet routing —
-# Tailscale's built-in SNAT can fail to reinitialize after daemon restart on fw3
-# kernels, causing forwarded LAN client traffic to break)
-if [ -n "$(uci -q get firewall.tailscale0)" ]; then
-    if [ "$(uci -q get firewall.tailscale0.masq)" != "1" ]; then
-        uci set firewall.tailscale0.masq=1
-        _fw_dirty=1
-    fi
-fi
-
-# Migration: remove legacy UCI firewall kill switch rules (pre-v1.0.9)
-for section in ts_ks_lan2wan ts_ks_guest2wan; do
-    [ -n "$(uci -q get firewall.$section)" ] && {
-        uci -q delete firewall.$section; _fw_dirty=1
-    }
-done
-
-# Single firewall commit + reload for all accumulated changes
+# Single firewall commit + reload for all accumulated guest forwarding changes
 [ "$_fw_dirty" = "1" ] && { uci commit firewall; /etc/init.d/firewall reload; }
 
 # Sync kill switch routing rules (ip rule + ip route)
