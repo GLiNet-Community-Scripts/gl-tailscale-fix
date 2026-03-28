@@ -208,18 +208,17 @@ Requires standard Linux tools (tar, gzip, install). No OpenWrt SDK needed.
 
 ## Firmware upgrades (sysupgrade)
 
-The plugin survives GL.iNet firmware upgrades automatically. All plugin files,
-configuration, and any updated Tailscale binary are preserved through sysupgrade
-via `/lib/upgrade/keep.d/gl-tailscale-fix`.
+The plugin survives GL.iNet firmware upgrades on firmware 4.x (up to 4.8.x)
+automatically. All plugin files, configuration, and any updated Tailscale binary
+are preserved through sysupgrade via `/lib/upgrade/keep.d/gl-tailscale-fix`.
+After reboot, settings, kill switch, guest routing, and exit node configuration
+are restored automatically by the watchdog and hotplug handlers.
 
-- **Minor upgrades (e.g. 4.8.2 → 4.8.3)**: The plugin works immediately after
-  reboot. Settings, kill switch, guest routing, and exit node configuration are
-  restored automatically by the watchdog and hotplug handlers.
-- **Major upgrades to 4.9+**: The plugin detects the incompatible firmware,
-  cleanly removes its routing rules and firewall state, disables its service,
-  and shows a warning banner in the admin panel. Remove the plugin with
-  `opkg remove gl-tailscale-fix` — GL's native Tailscale features replace
-  most plugin functionality in firmware 4.9+.
+On **firmware 4.9+**, the plugin detects the incompatible firmware, cleanly
+removes its routing rules and firewall state, disables its service, and shows
+a warning banner in the admin panel. Remove the plugin with
+`opkg remove gl-tailscale-fix` — GL's native Tailscale features replace most
+plugin functionality in firmware 4.9+.
 
 ## Compatibility
 
