@@ -288,11 +288,13 @@ Commercial licensing available for closed source use — contact [remotetohome.i
 | GL-BE6500 | Flint 3 | 4.8.4 | 23.05 | fw4 | v1.0.5 † | 1.92.5 |
 | GL-MT5000 | Brume 3 | 4.8.4 | 21.02 | fw4 | v1.0.18 ¶ | 1.80.3 / 1.96.3 |
 | GL-MT3600BE | Beryl 7 | 4.8.5 | 21.02 | fw3 | v1.0.18 ‡¶ | 1.94.2 |
+| GL-XE3000 | Puli AX | 4.8.3 | 21.02 | fw3 | v1.0.18 ✓ | 1.80.3 / 1.96.3 |
 | GL-A1300 | Slate Plus | 4.5.22 / 4.7.2β | — | fw3 | v1.0.18 §  | 1.6x |
 
 **†** Install/remove verified only (Tailscale not connected — feature testing pending).
 **‡** Community-verified: install/remove, UI injection, kill switch, guest routing ([#1](https://github.com/RemoteToHome-io/gl-tailscale-fix/issues/1)).
 **¶** Install + version manager (update to 1.96.3) verified.
+**✓** Full end-to-end verified: exit node server + client, kill switch, version manager (update to 1.96.3).
 **§** Plugin install verified on FW 4.5.22 and 4.7.2β. Exit node client + kill switch verified on 4.7.2β. Version manager not supported — Tailscale's own updater also fails on this model ([#6](https://github.com/RemoteToHome-io/gl-tailscale-fix/issues/6)).
 
 All features verified on AXT1800 and MT3000 with both factory (v1.80.3) and
