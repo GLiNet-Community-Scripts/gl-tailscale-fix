@@ -283,7 +283,8 @@ Commercial licensing available for closed source use — contact [remotetohome.i
 | GL-MT3000 | Beryl AX | 4.8.2β | 21.02 | fw3 | v1.0.18 | 1.80.3 / 1.94.2 |
 | GL-AX1800 | Flint | 4.6.8 | 21.02 | fw3 | v1.0.5 † | 1.66.4 |
 | GL-MT2500 | Brume 2 | 4.7.4 | 21.02 | fw3 | v1.0.5 † | 1.66.4 |
-| GL-MT6000 | Flint 2 | 4.8.3 | 21.02 | fw3 | v1.0.5 † | 1.80.3 |
+| GL-MT6000 | Flint 2 | 4.8.4 | 21.02 | fw3 | v1.0.18 ‡ | — |
+| GL-MT6000 | Flint 2 | 4.8.3 | 24 snapshot | fw4 | v1.0.18 ‡ | — |
 | GL-BE3600 | Slate 7 | 4.8.1 | 23.05 | fw4 | v1.0.5 † | 1.80.3 |
 | GL-BE6500 | Flint 3 | 4.8.4 | 23.05 | fw4 | v1.0.5 † | 1.92.5 |
 | GL-MT5000 | Brume 3 | 4.8.4 | 21.02 | fw4 | v1.0.18 ¶ | 1.80.3 / 1.96.3 |
