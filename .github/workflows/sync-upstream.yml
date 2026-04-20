@@ -1,0 +1,57 @@
+name: Sync Upstream
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    # Run daily at 03:17 UTC
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fast-forward main from upstream
+        env:
+          UPSTREAM_REPO: RemoteToHome-io/gl-tailscale-fix
+          UPSTREAM_BRANCH: main
+        run: |
+          set -euo pipefail
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" || true
+          git fetch upstream "${UPSTREAM_BRANCH}" --prune
+
+          LOCAL_SHA="$(git rev-parse HEAD)"
+          UPSTREAM_SHA="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+
+          if [ "${LOCAL_SHA}" = "${UPSTREAM_SHA}" ]; then
+            echo "main is already up to date with upstream/${UPSTREAM_BRANCH}."
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor "${LOCAL_SHA}" "${UPSTREAM_SHA}"; then
+            git merge --ff-only "upstream/${UPSTREAM_BRANCH}"
+            git push origin HEAD:main
+            echo "Fast-forward sync complete."
+            exit 0
+          fi
+
+          echo "main has commits not contained in upstream/${UPSTREAM_BRANCH}; skipping auto-sync."
+          exit 1
