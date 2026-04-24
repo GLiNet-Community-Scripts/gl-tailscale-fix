@@ -22,15 +22,16 @@ Tailscale admin console walkthrough.
   network (br-guest) and Tailscale interface (tailscale0), guest subnet route
   advertisement, and policy route fixup that ensures guest clients can use exit
   nodes and are covered by the kill switch.
-- **Tailscale SSH** — GUI toggle for `tailscale set --ssh`, enabling passwordless
-  SSH access from Tailscale peers. Requires an SSH ACL rule in the Tailscale
-  admin console (Access Controls → Tailscale SSH tab). Note: Tailscale SSH
-  takes over port 22 for Tailscale traffic — LAN clients using subnet routing
-  cannot use it. For SSH access from both Tailscale peers and LAN clients,
-  consider adding an alternate Dropbear port (e.g. 2222) in
-  System → Administration → SSH Access instead.
-  See [Tailscale SSH on GL.iNet Routers](https://remotetohome.io/blog/tailscale-ssh-on-glinet/)
-  for a detailed comparison of both approaches.
+- **Tailscale SSH** — GUI toggle for `tailscale set --ssh`, which enables
+  Tailscale's ACL-based SSH authentication. Most users don't need this —
+  SSH to the router's tailscale IP already works via the normal SSH daemon
+  (Dropbear) without any extra setup. Enable this only if you specifically
+  want identity-based access controlled by a Tailscale SSH ACL rule
+  (Access Controls → Tailscale SSH tab). While enabled, `tailscaled` takes
+  over port 22 for tailnet-origin traffic, which breaks SSH from LAN clients
+  that reach the router via Tailscale subnet routing; in that case, run
+  Dropbear on an alternate port (System → Administration → SSH Access)
+  to keep a path open for both Tailscale and LAN clients.
 - **Tailscale Version Manager** — installed vs latest version display, one-click
   update using space-optimized combined binaries, factory restore.
 
