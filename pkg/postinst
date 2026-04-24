@@ -34,25 +34,32 @@ if [ -f /etc/sysupgrade.conf ]; then
     sed -i '\|^/usr/sbin/tailscaled$|d' /etc/sysupgrade.conf 2>/dev/null
 fi
 
-# Firmware compatibility gate — don't enable service on 4.9+ firmware
-# (native Tailscale enhancements overlap with plugin features)
+# Firmware detection — on GL 4.9+ we keep the plugin fully active (Kill
+# Switch, Guest routing, SSH, Version Manager, masquerade) but hide UI
+# for features GL now provides natively (Advertise Exit Node).
 fw_ver=$(awk '{print $1}' /etc/glversion 2>/dev/null)
+is_fw49_plus=0
 if [ -n "$fw_ver" ]; then
     _major=$(echo "$fw_ver" | cut -d. -f1)
     _minor=$(echo "$fw_ver" | cut -d. -f2)
     if [ "$_major" -gt 4 ] 2>/dev/null || \
        { [ "$_major" -eq 4 ] && [ "$_minor" -ge 9 ]; } 2>/dev/null; then
-        logger -t ts-fix "Incompatible firmware ($fw_ver) — plugin installed but service not enabled"
-        # Still restart nginx so incompatibility banner shows in admin panel
-        if [ -x /etc/init.d/nginx ]; then
-            pgrep nginx >/dev/null 2>&1 && kill -9 $(pgrep nginx) 2>/dev/null
-            /etc/init.d/nginx start 2>/dev/null
-        fi
-        exit 0
+        is_fw49_plus=1
     fi
 fi
 
-# Enable and start procd service (registers UCI reload trigger for tailscale config)
+# Migration from v1.0.18 (wrongly auto-disabled on 4.9+): on any upgrade
+# to a 4.9+ router, set a one-shot hint so the UI prompts the user to
+# re-enable Kill Switch. Fresh installs don't get the hint. The flag is
+# cleared automatically when the user enables KS via the UI, or by the
+# dismiss button. PKG_UPGRADE=1 is set by opkg on upgrade install.
+if [ "$PKG_UPGRADE" = "1" ] && [ "$is_fw49_plus" = "1" ]; then
+    uci -q set ts-fix.settings.ks_upgrade_hint_pending=1
+    uci commit ts-fix
+    logger -t ts-fix "Firmware $fw_ver upgrade — KS re-enable hint set"
+fi
+
+# Enable and start procd service (runs watchdog on every firmware version)
 if [ -x /etc/init.d/ts-fix ]; then
     /etc/init.d/ts-fix enable 2>/dev/null
     /etc/init.d/ts-fix start 2>/dev/null

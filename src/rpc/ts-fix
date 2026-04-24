@@ -230,23 +230,25 @@ local function set_killswitch_route(enabled)
     end
 end
 
--- Firmware compatibility check — GL 4.9+ has native Tailscale enhancements
--- that overlap with our features. Cached at module load (doesn't change at runtime).
-local function is_firmware_compatible()
+-- Firmware detection — on GL 4.9+, some features overlap with GL's native
+-- Tailscale enhancements. We keep the plugin fully active but hide UI for
+-- features GL provides natively (Advertise Exit Node) and skip the
+-- corresponding tailscale set calls. Cached at module load (firmware
+-- version doesn't change at runtime).
+local function detect_firmware()
     local f = io.open("/etc/glversion", "r")
-    if not f then return true end  -- non-GL firmware, assume compatible
-    local ver = f:read("*l") or ""
+    if not f then return "", false end  -- non-GL firmware
+    local line = f:read("*l") or ""
     f:close()
+    local ver = line:match("^(%S+)") or ""
     local major, minor = ver:match("^(%d+)%.(%d+)")
-    if not major then return true end
+    if not major then return ver, false end
     major, minor = tonumber(major), tonumber(minor)
-    if major > 4 or (major == 4 and minor >= 9) then
-        return false
-    end
-    return true
+    local is_49_plus = major > 4 or (major == 4 and minor >= 9)
+    return ver, is_49_plus
 end
 
-local firmware_compatible = is_firmware_compatible()
+local firmware_version, fw_is_49_plus = detect_firmware()
 
 --[[
     @method-type: call
@@ -265,25 +267,25 @@ local firmware_compatible = is_firmware_compatible()
     @out bool   route_guest_fw_active  Whether guest→tailscale forwardings are currently active
 --]]
 function M.get_config()
-    -- Report firmware incompatibility to frontend
-    if not firmware_compatible then
-        local fw = exec("awk '{print $1}' /etc/glversion 2>/dev/null") or "unknown"
-        return { firmware_incompatible = true, firmware_version = fw:gsub("%s+$", "") }
-    end
-
     -- Ensure masquerade on every config read (covers first page visit after
     -- install, even if no ts-fix features are active — needed for LAN clients
-    -- to reach Tailscale peers through subnet routing)
+    -- to reach Tailscale peers through subnet routing). Defense-in-depth on
+    -- all firmware, including 4.9+ where it coexists with GL's native toggle.
     ensure_masquerade()
 
     local c = uci.cursor()
     local res = {}
+
+    -- Firmware info (drives per-feature UI gating on 4.9+)
+    res.firmware_version = firmware_version
+    res.firmware_49_plus = fw_is_49_plus
 
     -- Our UCI settings
     res.advertise_exit_node = c:get(TS_FIX_CONFIG, "settings", "advertise_exit_node") == "1"
     res.kill_switch = c:get(TS_FIX_CONFIG, "settings", "kill_switch") == "1"
     res.route_guest = c:get(TS_FIX_CONFIG, "settings", "route_guest") == "1"
     res.tailscale_ssh = c:get(TS_FIX_CONFIG, "settings", "tailscale_ssh") == "1"
+    res.ks_upgrade_hint_pending = c:get(TS_FIX_CONFIG, "settings", "ks_upgrade_hint_pending") == "1"
 
     -- GL's Tailscale UCI settings
     res.ts_enabled = c:get(TS_CONFIG, "settings", "enabled") == "1"
@@ -346,10 +348,6 @@ end
     @in  bool  ?tailscale_ssh         Enable/disable Tailscale SSH server
 --]]
 function M.set_config(params)
-    if not firmware_compatible then
-        return { err_code = -2, err_msg = "Plugin incompatible with this firmware version" }
-    end
-
     local c = uci.cursor()
 
     -- Check tailscale is enabled
@@ -374,6 +372,10 @@ function M.set_config(params)
         local val = params.kill_switch and "1" or "0"
         c:set(TS_FIX_CONFIG, "settings", "kill_switch", val)
         set_killswitch_route(params.kill_switch)
+        -- User interacted with the KS toggle — clear the v1.0.18→v1.0.19
+        -- migration hint whether they enabled or disabled it. The hint's
+        -- job was to draw attention to the toggle, and they've seen it.
+        c:set(TS_FIX_CONFIG, "settings", "ks_upgrade_hint_pending", "0")
     end
 
     -- Handle route_guest
@@ -394,8 +396,11 @@ function M.set_config(params)
     c:commit(TS_FIX_CONFIG)
     fs.sync()
 
-    -- Apply exit node setting (only when it was actually changed)
-    if exit_node_changed then
+    -- Apply exit node setting (only when it was actually changed).
+    -- On GL 4.9+, skip entirely — GL manages this natively via run_exit_node
+    -- UCI, and running tailscale set would fight its state. The UCI value is
+    -- still stored above for continuity if the user ever downgrades to 4.8.x.
+    if exit_node_changed and not fw_is_49_plus then
         local advertise = c:get(TS_FIX_CONFIG, "settings", "advertise_exit_node") == "1"
         if advertise then
             exec("/usr/sbin/tailscale set --advertise-exit-node 2>/dev/null")
@@ -600,6 +605,20 @@ end
 function M.force_check_versions()
     ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--check"})
     ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--check-plugin"})
+    return {}
+end
+
+--[[
+    @method-type: call
+    @method-name: dismiss_ks_hint
+    @method-desc: Dismiss the post-upgrade "re-enable Kill Switch" hint.
+    Called from the UI dismiss button; also cleared automatically when the
+    user enables the kill switch via set_config.
+--]]
+function M.dismiss_ks_hint()
+    local c = uci.cursor()
+    c:set(TS_FIX_CONFIG, "settings", "ks_upgrade_hint_pending", "0")
+    c:commit(TS_FIX_CONFIG)
     return {}
 end
 

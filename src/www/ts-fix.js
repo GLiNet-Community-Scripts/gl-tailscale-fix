@@ -384,7 +384,10 @@ var state = {
   exit_node_active: false,
   ssh_active: false,
   kill_switch_fw_active: false,
-  route_guest_fw_active: false
+  route_guest_fw_active: false,
+  firmware_49_plus: false,
+  firmware_version: '',
+  ks_upgrade_hint_pending: false
 };
 
 var updateState = {};
@@ -432,12 +435,20 @@ function isGlExitNodeEnabled() {
 function refreshUI() {
   var notReady = !state.ts_enabled || !state.ts_running;
 
-  // Hide toggle rows entirely when Tailscale is disabled
-  showRow('exit-node', state.ts_enabled);
+  // Informational banner on 4.9+ (explains coexistence with GL native features)
+  ensureInformationalBanner();
+
+  // Hide toggle rows entirely when Tailscale is disabled.
+  // On GL 4.9+, also hide Advertise as Exit Node — GL provides this natively
+  // via the "Run Exit Node" toggle in its Tailscale admin UI.
+  showRow('exit-node', state.ts_enabled && !state.firmware_49_plus);
   showRow('route-guest', state.ts_enabled);
   showRow('tailscale-ssh', state.ts_enabled);
   // Show kill switch when exit node is configured (backend) OR toggled on in GL UI (pre-Apply)
   showRow('kill-switch', state.ts_enabled && (state.exit_node_ip !== '' || isGlExitNodeEnabled()));
+
+  // Post-upgrade KS re-enable hint on 4.9+ (evaluated after row visibility)
+  ensureMigrationHint();
 
   // Show "enable Tailscale" hint when disabled
   var hint = document.getElementById('ts-fix-disabled-hint');
@@ -464,10 +475,11 @@ function refreshUI() {
   setToggle('tailscale-ssh', state.tailscale_ssh, notReady);
   setToggle('kill-switch', state.kill_switch, notReady);
 
-  // WAN warning: show when exit node enabled but Allow Remote Access WAN is off
+  // WAN warning: show when exit node enabled but Allow Remote Access WAN is off.
+  // Hidden on 4.9+ since the Advertise as Exit Node toggle itself is hidden there.
   var wanWarn = document.getElementById('ts-fix-wan-warn');
   if (wanWarn) {
-    if (state.advertise_exit_node && !state.wan_enabled) {
+    if (state.advertise_exit_node && !state.wan_enabled && !state.firmware_49_plus) {
       wanWarn.classList.remove('ts-fix-hidden');
     } else {
       wanWarn.classList.add('ts-fix-hidden');
@@ -521,48 +533,153 @@ function refreshUI() {
   }
 }
 
-// -- Data fetching --
+// -- 4.9+ informational banner --
+// GL firmware 4.9 added native Advertise Exit Node, WAN subnet advertisement,
+// and IP Masquerading. This plugin still provides what GL doesn't: a
+// daemon-independent kernel-level Kill Switch, Guest routing through the
+// exit node, the Version Manager, and the Tailscale SSH toggle.
 
-function showIncompatibleBanner(fwVersion) {
+function ensureInformationalBanner() {
   var section = document.getElementById(INJECT_ID);
   if (!section) return;
-  section.innerHTML = '';
+  var existing = document.getElementById('ts-fix-fw49-banner');
+  if (!state.firmware_49_plus) {
+    if (existing) existing.remove();
+    return;
+  }
+  if (existing) return;
+
+  // Collapsed state persisted per-router in localStorage. Default collapsed —
+  // user has seen it; the header alone is enough to signal "coexisting with GL".
+  var STORAGE_KEY = 'ts-fix-fw49-banner-collapsed';
+  var collapsed = localStorage.getItem(STORAGE_KEY) !== '0';
+
   var banner = document.createElement('div');
-  banner.style.cssText = 'padding:20px;background:#fff3cd;border:1px solid #ffc107;'
-    + 'border-radius:8px;margin:15px 0;color:#856404;text-align:center;';
-  var strong = document.createElement('strong');
-  strong.textContent = 'gl-tailscale-fix is not compatible with firmware '
-    + (fwVersion || '4.9+') + '.';
-  banner.appendChild(strong);
-  banner.appendChild(document.createElement('br'));
-  banner.appendChild(document.createTextNode(
-    'This firmware version has native Tailscale enhancements that replace the plugin.'));
-  banner.appendChild(document.createElement('br'));
-  banner.appendChild(document.createTextNode('Please remove: '));
-  var code = document.createElement('code');
-  code.style.cssText = 'background:#ffeeba;padding:2px 6px;border-radius:3px;';
-  code.textContent = 'opkg remove gl-tailscale-fix';
-  banner.appendChild(code);
-  banner.appendChild(document.createElement('br'));
-  banner.appendChild(document.createTextNode('Refer to the '));
+  banner.id = 'ts-fix-fw49-banner';
+  banner.style.cssText = 'padding:10px 15px;background:#edf4ff;'
+    + 'border-left:3px solid #5272f7;color:#303133;font-size:12px;'
+    + 'line-height:1.5;';
+
+  var header = document.createElement('div');
+  header.style.cssText = 'display:flex;align-items:center;gap:8px;'
+    + 'cursor:pointer;font-weight:600;user-select:none;';
+
+  var caret = document.createElement('span');
+  caret.style.cssText = 'display:inline-block;transition:transform 0.15s;'
+    + 'font-size:10px;color:#5272f7;width:10px;text-align:center;';
+  caret.textContent = '\u25b8';
+  header.appendChild(caret);
+
+  var title = document.createElement('span');
+  title.textContent = 'Firmware ' + (state.firmware_version || '4.9+')
+    + ' — enhancing GL\u2019s Tailscale integration';
+  header.appendChild(title);
+
+  banner.appendChild(header);
+
+  var details = document.createElement('div');
+  details.style.cssText = 'margin:8px 0 0 18px;';
+
+  details.appendChild(document.createTextNode(
+    'gl-tailscale-fix builds on GL firmware 4.9\u2019s native Tailscale '
+    + 'support (Exit Node, subnet advertisement, IP Masquerading) by adding:'));
+
+  var ul = document.createElement('ul');
+  ul.style.cssText = 'margin:6px 0 6px 18px;padding:0;';
+  ['Kill Switch with kernel-level protection that persists through daemon restarts',
+   'Guest network routing through the exit node',
+   'Tailscale Version Manager',
+   'Tailscale SSH toggle'].forEach(function(t) {
+    var li = document.createElement('li');
+    li.textContent = t;
+    ul.appendChild(li);
+  });
+  details.appendChild(ul);
+
   var link = document.createElement('a');
   link.href = 'https://remotetohome.io/blog/gl-tailscale-fix/';
   link.target = '_blank';
   link.rel = 'noopener';
-  link.style.cssText = 'color:#856404;text-decoration:underline;';
-  link.textContent = 'plugin documentation';
-  banner.appendChild(link);
-  banner.appendChild(document.createTextNode(' for current compatibility status.'));
-  section.appendChild(banner);
+  link.style.cssText = 'color:#5272f7;text-decoration:none;';
+  link.textContent = 'Plugin documentation \u2192';
+  details.appendChild(link);
+
+  banner.appendChild(details);
+
+  function applyCollapsed(isCollapsed) {
+    details.style.display = isCollapsed ? 'none' : '';
+    caret.style.transform = isCollapsed ? '' : 'rotate(90deg)';
+  }
+  applyCollapsed(collapsed);
+
+  header.addEventListener('click', function() {
+    collapsed = !collapsed;
+    try { localStorage.setItem(STORAGE_KEY, collapsed ? '1' : '0'); } catch (e) {}
+    applyCollapsed(collapsed);
+  });
+
+  var divider = section.querySelector('.ts-fix-divider');
+  if (divider && divider.nextSibling) {
+    section.insertBefore(banner, divider.nextSibling);
+  } else {
+    section.appendChild(banner);
+  }
 }
+
+// -- Kill Switch migration hint (v1.0.18 → v1.0.19 on 4.9+) --
+// Shown when: firmware is 4.9+, postinst set ks_upgrade_hint_pending=1
+// (signalling a prior-version teardown may have wiped KS), and KS is
+// currently off. Auto-clears when the user enables KS; dismissible.
+
+function ensureMigrationHint() {
+  var ksRow = document.getElementById('ts-fix-row-kill-switch');
+  var existing = document.getElementById('ts-fix-ks-migration-hint');
+
+  var shouldShow = state.firmware_49_plus
+    && state.ks_upgrade_hint_pending
+    && !state.kill_switch
+    && ksRow
+    && !ksRow.classList.contains('ts-fix-hidden');
+
+  if (!shouldShow) {
+    if (existing) existing.remove();
+    return;
+  }
+  if (existing) return;
+
+  var hint = document.createElement('div');
+  hint.id = 'ts-fix-ks-migration-hint';
+  hint.className = 'ts-fix-row';
+  hint.style.cssText = 'background:#fff8e1;color:#856404;font-size:12px;'
+    + 'line-height:1.4;align-items:center;';
+
+  var msg = document.createElement('div');
+  msg.style.cssText = 'flex:1;padding-right:10px;';
+  msg.textContent = '\u26a0 Kill Switch was reset during a recent plugin'
+    + ' upgrade. Enable it below to restore protection.';
+  hint.appendChild(msg);
+
+  var dismiss = document.createElement('button');
+  dismiss.textContent = 'Dismiss';
+  dismiss.style.cssText = 'padding:3px 12px;border-radius:12px;'
+    + 'border:1px solid #856404;background:transparent;color:#856404;'
+    + 'font-size:11px;cursor:pointer;flex-shrink:0;';
+  dismiss.onclick = dismissKsHint;
+  hint.appendChild(dismiss);
+
+  ksRow.parentNode.insertBefore(hint, ksRow);
+}
+
+function dismissKsHint() {
+  state.ks_upgrade_hint_pending = false;
+  ensureMigrationHint();
+  rpc('ts-fix', 'dismiss_ks_hint', {}).catch(function() {});
+}
+
+// -- Data fetching --
 
 function fetchConfig() {
   rpc('ts-fix', 'get_config', {}).then(function(res) {
-    if (res.firmware_incompatible) {
-      showIncompatibleBanner(res.firmware_version);
-      stopRefreshTimer();
-      return;
-    }
     if (res.err_code) return;
     Object.keys(res).forEach(function(k) {
       // Don't overwrite keys with pending (unstaged) changes
@@ -792,7 +909,8 @@ function reapplyAfterGlRestart() {
     // Kill switch uses kernel ip rules/routes which survive the restart — no
     // reapply needed. Reapplying KS here would race with ts-fix-reapply's
     // auto-disable (exit_node_ip empty → kill_switch=0) and overwrite it.
-    if (state.advertise_exit_node) {
+    // On 4.9+, skip advertise_exit_node — GL manages it natively.
+    if (state.advertise_exit_node && !state.firmware_49_plus) {
       params.advertise_exit_node = true;
       needReapply = true;
     }
@@ -826,7 +944,8 @@ function reapplyAfterGlRestart() {
       var needFix = false;
       var fixParams = {};
 
-      if (state.advertise_exit_node && !res.exit_node_active) {
+      // On 4.9+, GL manages advertise_exit_node natively — don't fight its state
+      if (state.advertise_exit_node && !res.exit_node_active && !state.firmware_49_plus) {
         fixParams.advertise_exit_node = true;
         needFix = true;
       }
