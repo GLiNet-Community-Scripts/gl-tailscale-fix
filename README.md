@@ -124,7 +124,7 @@ Drop-in scripts for common integration patterns live in the [`examples/`](exampl
 
 [`examples/gl-switch.d/Tailscale.sh`](examples/gl-switch.d/Tailscale.sh) toggles GL's native Tailscale and the plugin's Kill Switch together when you flip the physical side switch on supported GL.iNet routers.
 
-**Prerequisites**: Tailscale should already be configured and working in the GL admin UI before deploying this script — plugin installed, Tailscale bound to your account, at least one Custom Exit Node selected, and exit node + subnet routes approved in the [Tailscale admin console](https://login.tailscale.com/admin/machines). See the [setup guide](https://remotetohome.io/gl-tailscale-fix#setup-guide) for the full walkthrough. The script header lists the full prerequisite checklist.
+**Prerequisites**: Tailscale should already be configured and working in the GL admin UI before deploying this script — plugin installed, Tailscale bound to your account, at least one Custom Exit Node selected, and exit node + subnet routes approved in the [Tailscale admin console](https://login.tailscale.com/admin/machines). No WireGuard or OpenVPN client tunnel should be active on this router for LAN/guest traffic, since competing VPN routing conflicts with Tailscale's exit-node path (details in [Architecture](#architecture)). See the [setup guide](https://remotetohome.io/gl-tailscale-fix#setup-guide) for the full walkthrough. The script header lists the full prerequisite checklist.
 
 Install on the router:
 

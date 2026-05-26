@@ -14,7 +14,11 @@
 #      https://login.tailscale.com/admin/machines (Edit route settings → Use as exit node).
 #   5. If LAN_ENABLED=true (the default): this router's LAN subnet route also approved in the
 #      Tailscale admin console.
-#   6. End-to-end tested in the GL UI before relying on the slider — enable Tailscale, select
+#   6. No WireGuard or OpenVPN client tunnel active on this router for LAN/guest traffic —
+#      competing VPN clients install policy routing rules (typically priority 6000) that win
+#      against Tailscale's exit-node routing (priority 5270), so Tailscale traffic wouldn't
+#      actually flow through the exit node. Disable any active WG/OVPN client first.
+#   7. End-to-end tested in the GL UI before relying on the slider — enable Tailscale, select
 #      the exit node, confirm your LAN clients route through it and the kill switch engages.
 #
 # Install on the router:
