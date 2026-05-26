@@ -118,7 +118,7 @@ On **firmware 4.9+**, the plugin detects the newer firmware and adapts its UI: t
 
 ## Accessories
 
-Companion scripts and sidecar utilities live in the [`accessories/`](accessories/) directory. These are full-featured add-ons (not illustrative snippets) that customers can deploy as-is on their routers.
+Companion scripts and sidecar utilities live in the [`accessories/`](accessories/) directory. These are add-on functionality that customers can deploy on their gl-tailscale-fix enhanced routers.
 
 ### Side switch toggle (physical switch on Beryl AX, Slate AX, etc.)
 
