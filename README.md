@@ -128,7 +128,7 @@ Drop-in scripts for common integration patterns live in the [`examples/`](exampl
 
 **What the slider does on "on"**: The script first installs a temporary full-router lockdown (blackholes all LAN/guest forwarding) to eliminate any IP-leak window during the transition. It then defensively disables GL's stock WireGuard, OpenVPN, and Tor clients to prevent routing-priority conflicts that would otherwise leave Tailscale unable to actually route through the exit node (details in [Architecture](#architecture)). Once Tailscale is up and the plugin's kill switch is engaged per your script configuration, the lockdown releases and traffic flows through the exit node. Expect roughly 5–10 seconds of LAN traffic disruption during the transition.
 
-**Note on custom routing**: The defensive disable covers GL's stock VPN clients only. If you have third-party VPN apps, AmneziaWG, custom iptables rules, manually-installed wireguard-go, or any other non-GL-OEM routing on the router, disable that yourself before enabling the slider — the script can't auto-detect arbitrary user-installed routing.
+**Note on custom routing**: The defensive disable covers GL's stock VPN clients only. If you have ZeroTier managed routes, third-party VPN apps, proxy clients, custom iptables rules, or any other non-GL-OEM routing on the router, disable that yourself before enabling the slider — the script can't auto-detect arbitrary user-installed routing.
 
 Install on the router:
 

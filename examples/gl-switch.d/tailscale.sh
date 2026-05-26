@@ -28,8 +28,8 @@
 #      full-router lockdown then defensively disables those clients via their built-in
 #      /etc/gl-switch.d/ scripts before bringing Tailscale up. You do NOT need to
 #      manually disable GL's stock VPN clients in the GUI first. HOWEVER, any custom
-#      routing (third-party VPN apps, AmneziaWG, custom iptables, manually-installed
-#      wireguard-go, etc.) is your responsibility to disable before relying on the
+#      routing (ZeroTier managed routes, third-party VPN apps, proxy clients, custom
+#      iptables, etc.) is your responsibility to disable before relying on the
 #      slider — the script can't auto-detect arbitrary user-installed routing.
 #   7. End-to-end tested in the GL UI before relying on the slider — enable Tailscale,
 #      select the exit node, confirm your LAN clients route through it and the kill
