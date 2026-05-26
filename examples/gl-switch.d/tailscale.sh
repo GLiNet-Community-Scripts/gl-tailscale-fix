@@ -79,7 +79,13 @@
 # Released under the same terms as gl-tailscale-fix (GPL-3.0).
 
 # --- Configuration ---
-DEFAULT_EXIT_NODE_IP="XX.XX.XX.XX"   # Fallback only — used on first run when GL has no selection
+
+# Fallback exit node IP, used ONLY when GL has no current Custom Exit Node selection
+# in UCI (first run, or after a manual clear). Once you've selected a Custom Exit Node
+# in the GL admin UI, this value is ignored and the script reuses GL's current
+# selection on every "on" flip — so changing the selection in the GL UI sticks across
+# slider toggles.
+DEFAULT_EXIT_NODE_IP="XX.XX.XX.XX"
 
 # GL native settings
 # Allow Remote Access LAN — required for tailnet peers to reach LAN devices behind this
