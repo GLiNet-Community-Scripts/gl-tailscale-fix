@@ -23,13 +23,14 @@
 #      https://login.tailscale.com/admin/machines (Edit route settings → Use as exit node).
 #   5. If LAN_ENABLED=true (the default): this router's LAN subnet route also approved
 #      in the Tailscale admin console.
-#   6. Any WireGuard, OpenVPN, or Tor client tunnel managed via the GL admin UI (Apps
-#      menu) should be disabled before configuring the slider. Their policy routing at
-#      priority 6000 wins against Tailscale's exit-node routing at priority 5270, so
-#      Tailscale traffic wouldn't actually flow through the exit node. The script also
-#      defensively disables WG/OVPN/Tor on each "on" flip — but only as a backup for
-#      the case where the slider was previously bound to one of those functions and is
-#      being rebound to Tailscale. It is not a substitute for the proper GUI-side disable.
+#   6. The script handles routing conflicts with GL's stock VPN clients (WireGuard,
+#      OpenVPN, Tor) automatically — on every "on" flip, it installs a temporary
+#      full-router lockdown then defensively disables those clients via their built-in
+#      /etc/gl-switch.d/ scripts before bringing Tailscale up. You do NOT need to
+#      manually disable GL's stock VPN clients in the GUI first. HOWEVER, any custom
+#      routing (third-party VPN apps, AmneziaWG, custom iptables, manually-installed
+#      wireguard-go, etc.) is your responsibility to disable before relying on the
+#      slider — the script can't auto-detect arbitrary user-installed routing.
 #   7. End-to-end tested in the GL UI before relying on the slider — enable Tailscale,
 #      select the exit node, confirm your LAN clients route through it and the kill
 #      switch engages.
