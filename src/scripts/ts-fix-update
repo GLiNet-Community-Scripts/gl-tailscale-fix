@@ -5,6 +5,10 @@
 # Combined binaries from admonstrator/glinet-tailscale-updater
 set -e
 
+# `timeout` ships in ROM on GL 4.8.4, 4.9.0 and 4.11. Where it is missing, run the command
+# unbounded as before rather than not at all: without it every bounded call would fail with 127.
+command -v timeout >/dev/null 2>&1 || timeout() { shift; "$@"; }
+
 LOCK="/tmp/ts-fix-update.lock"
 STATUS="/tmp/ts-fix-update.status"
 CACHE="/tmp/ts-fix-latest-version"
@@ -41,6 +45,15 @@ set_status() {
 }
 
 cleanup() {
+    # Guaranteed terminal status: if we are exiting while the status file still
+    # says "running", the script died unexpectedly (set -e, a timeout, OOM kill)
+    # and the UI would otherwise show a stuck spinner forever — observed live
+    # 2026-07-05 when a download died mid-transfer on a degraded tunnel path.
+    # Normal success/error paths write their status before exiting, so this
+    # only fires on abnormal exits. (kill -9 still bypasses it.)
+    if grep -q '"status":"running"' "$STATUS" 2>/dev/null; then
+        set_status "error" "Interrupted unexpectedly - check network and retry"
+    fi
     rm -f "$LOCK"
 }
 
@@ -48,10 +61,17 @@ cleanup() {
 
 do_check() {
     local latest
-    latest=$(wget -qO- "$TINY_URL/version.txt" 2>/dev/null)
+    # Bounded fetch: -T covers connect/read stalls (GL's wget is uclient-fetch),
+    # the outer timeout caps total time — a crawling-but-alive transfer trips
+    # neither -T nor a read timeout on its own.
+    latest=$(timeout 60 wget -T 30 -qO- "$TINY_URL/version.txt" 2>/dev/null | head -1 | tr -d '\r') || true
 
     if [ -n "$latest" ]; then
-        latest=$(base_ver "$latest")
+        # Cache the FULL version string (e.g. "1.98.8-tiny.by.admon.1320").
+        # Upstream replaces release assets in place under the same base version
+        # (the 2026-06-04 ipnbus fix shipped that way), so the build suffix is
+        # what distinguishes a fixed rebuild from a buggy install. The RPC
+        # compares full strings and derives the display base itself.
         echo "$latest" > "$CACHE"
     fi
 }
@@ -60,7 +80,7 @@ do_check() {
 
 do_check_plugin() {
     local api_response
-    api_response=$(wget -qO- "https://api.github.com/repos/RemoteToHome-io/gl-tailscale-fix/releases/latest" 2>/dev/null)
+    api_response=$(timeout 60 wget -T 30 -qO- "https://api.github.com/repos/RemoteToHome-io/gl-tailscale-fix/releases/latest" 2>/dev/null) || true
 
     if [ -z "$api_response" ]; then
         # Private repo, network error, or rate limit — write empty to indicate checked but unavailable
@@ -86,6 +106,7 @@ do_check_plugin() {
 do_install() {
     exec 200>"$LOCK"
     flock -n 200 || { echo "Update already running"; exit 1; }
+    trap 'cleanup; exit 1' TERM INT
     trap cleanup EXIT
 
     set_status "running" "Detecting architecture..."
@@ -99,9 +120,11 @@ do_install() {
 
     set_status "running" "Checking latest version..."
 
-    # Get latest version from combined binary releases
+    # Get latest version from combined binary releases — FULL string, including
+    # the -tiny.by.admon.NNNN build suffix (verified live: version.txt serves
+    # the full string)
     local ver_raw latest_ver
-    ver_raw=$(wget -qO- "$TINY_URL/version.txt" 2>/dev/null)
+    ver_raw=$(timeout 60 wget -T 30 -qO- "$TINY_URL/version.txt" 2>/dev/null | head -1 | tr -d '\r') || true
     if [ -z "$ver_raw" ]; then
         set_status "error" "Failed to check latest version"
         exit 1
@@ -113,15 +136,18 @@ do_install() {
         exit 1
     fi
 
-    # Cache it
-    echo "$latest_ver" > "$CACHE"
+    # Cache it (full string — see do_check)
+    echo "$ver_raw" > "$CACHE"
 
-    # Check current version
-    local current_ver
-    current_ver=$(base_ver "$($TS_BIN version 2>/dev/null | head -1 | awk '{print $1}')")
+    # Check current version — FULL-string compare. A base-version compare
+    # misses in-place rebuilds (same base, new build suffix): after the
+    # upstream ipnbus fix on 2026-06-04, buggy and fixed binaries were both
+    # "1.98.5" by base and stuck routers reported "Already at latest" forever.
+    local current_full
+    current_full=$($TS_BIN version 2>/dev/null | head -1 | awk '{print $1}') || true
 
-    if [ "$current_ver" = "$latest_ver" ]; then
-        set_status "success" "Already at latest version ($latest_ver)"
+    if [ -n "$current_full" ] && [ "$current_full" = "$ver_raw" ]; then
+        set_status "success" "Already at latest version ($ver_raw)"
         exit 0
     fi
 
@@ -143,9 +169,13 @@ do_install() {
     local tmpfile="/tmp/$binary"
 
     rm -f "$tmpfile"
-    if ! wget -qO "$tmpfile" "$url" 2>/dev/null; then
+    # Bounded download: -T catches connect/read stalls, the outer timeout caps
+    # total transfer time. A healthy pull is ~6MB in well under a minute; a
+    # degraded path that would otherwise crawl indefinitely dies here with a
+    # clean error instead of leaving the UI spinner stuck (observed 2026-07-05).
+    if ! timeout 300 wget -T 30 -qO "$tmpfile" "$url" 2>/dev/null; then
         rm -f "$tmpfile"
-        set_status "error" "Download failed"
+        set_status "error" "Download failed or timed out"
         exit 1
     fi
 
@@ -188,9 +218,9 @@ do_install() {
     sleep 3
 
     local new_ver
-    new_ver=$(base_ver "$($TS_BIN version 2>/dev/null | head -1 | awk '{print $1}')")
+    new_ver=$($TS_BIN version 2>/dev/null | head -1 | awk '{print $1}') || true
 
-    set_status "success" "Updated to ${new_ver:-$latest_ver}"
+    set_status "success" "Updated to ${new_ver:-$ver_raw}"
 }
 
 # -- Restore mode: restore factory binaries --
@@ -198,6 +228,7 @@ do_install() {
 do_restore() {
     exec 200>"$LOCK"
     flock -n 200 || { echo "Operation already running"; exit 1; }
+    trap 'cleanup; exit 1' TERM INT
     trap cleanup EXIT
 
     set_status "running" "Restoring factory binaries..."

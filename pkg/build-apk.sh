@@ -13,6 +13,9 @@
 #   prerm    -> pre-deinstall                    (removal only — apk upgrades never run it,
 #                                                 which is exactly the PKG_UPGRADE=1 skip
 #                                                 the opkg prerm implements by hand)
+#   postrm   -> post-deinstall                   (drops the nginx injection AFTER the files
+#                                                 are gone — the only point where a restart
+#                                                 actually removes it; likewise removal-only)
 #
 # Requirements: apk-tools >= 3 (apk mkpkg), run as root (CI container) or inside a rootless
 # user namespace (`unshare -r sh -c '…'`) — extraction must preserve the archive's 0/0
@@ -24,6 +27,8 @@
 #
 # Usage: build-apk.sh <path/to/package.ipk> [out-dir]
 set -eu
+# Pinned as in build.sh, where a 002 umask left the archive roots 0775: no mode made here may vary.
+umask 022
 
 IPK="$1"
 OUT_DIR="${2:-$(dirname "$IPK")}"
@@ -78,6 +83,7 @@ APK_VERSION=$(echo "$VERSION" | sed 's/-ci\./_p/')
 SCRIPTS=""
 [ -f "$WORK/ctrl/postinst" ] && SCRIPTS="$SCRIPTS --script post-install:$WORK/ctrl/postinst --script post-upgrade:$WORK/ctrl/postinst"
 [ -f "$WORK/ctrl/prerm" ]    && SCRIPTS="$SCRIPTS --script pre-deinstall:$WORK/ctrl/prerm"
+[ -f "$WORK/ctrl/postrm" ]   && SCRIPTS="$SCRIPTS --script post-deinstall:$WORK/ctrl/postrm"
 
 OUT="$OUT_DIR/${NAME}-${APK_VERSION}.apk"
 # SOURCE_DATE_EPOCH=0 mirrors package-pack.mk (reproducible timestamps).

@@ -1,9 +1,11 @@
 #!/bin/sh
 # gl-tailscale-fix: Watchdog for Tailscale state changes
-# Polls every 5 seconds. (1) Detects Tailscale disabled while our kill-switch
-# rules are still installed → runs teardown. (2) Ensures the KS is re-asserted if
-# it is armed (kill_switch=1 + TS enabled) but the rule is missing — a boot/clobber
-# backstop. Necessary because
+# Polls every 5 seconds. (1) Detects Tailscale disabled while ts-fix state is
+# still applied → runs teardown. (2) Runs the kill-switch engine's consistency
+# pass — the plugin's only periodic enforcement point for both kill-switch
+# layers, and the engine self-gates. (3) Reconciles a stuck daemon exit node (GL
+# UCI cleared but the daemon still routing — buggy tiny-binary builds).
+# (4) Enforces the opt-in ks_follow_exit_node preference. Necessary because
 # procd_add_reload_trigger does NOT work on GL firmware (uci commit does not
 # emit config.change events), so nothing else notifies ts-fix when Tailscale is
 # turned off.
@@ -11,54 +13,206 @@
 # Design C: the kill switch is NOT torn down on exit-node removal — only on a
 # Tailscale disable (here) or the user turning the KS toggle off (RPC/reapply).
 # It stays armed through restart transients, fail-secure (block, never leak).
+# The optional ks_follow_exit_node mode below is the one deliberate exception,
+# and it keys on GL's durable exit_node_ip UCI — never the daemon's transient
+# ExitNodeID — so restart transients still cannot flap it.
 # Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
 # https://github.com/RemoteToHome-io/gl-tailscale-fix
 
+# Every call into the tailscale CLI below runs under `timeout 10`: this loop is the kill switch's
+# periodic backstop, and one hung call would stop it. `timeout` ships in ROM on GL 4.8.4, 4.9.0 and
+# 4.11. Where it is missing, run the command unbounded as before rather than not at all: without it
+# every bounded call would fail with 127.
+command -v timeout >/dev/null 2>&1 || timeout() { shift; "$@"; }
+
 # State tracking removed — the TS-disabled check below is now idempotent
-# (fires on any poll where TS is off AND KS rules are still installed),
+# (fires on any poll where TS is off AND ts-fix state is still applied),
 # catching both the normal 1→0 transition AND the fast 1→0→1 sequence
 # where the prior transition-based check silently missed the disable.
 # Verified empirically 2026-04-25 on AXT1800 4.8.3 v1.0.19: three rapid
 # disable→re-enable cycles within one 5s poll window, only one teardown
 # logged with the old logic.
 
+stuck_polls=0
+set_stuck_polls=0
+
+# Clean-exit discipline for procd stops/restarts (idiom shared with
+# gl-zerotier-fix): trap TERM/INT to exit 0, with the sleep backgrounded and
+# wait'ed so the trap fires immediately. Measured on the MT3000: the previous
+# plain `sleep 5` with NO trap also died instantly on TERM (default signal
+# disposition kills ash even mid-wait), so this does not fix a slow stop —
+# it makes the exit a clean 0 instead of a signaled death, handles INT for
+# interactive runs, and keeps stops instant if a cleanup trap is ever added:
+# a trap WITHOUT the backgrounded sleep defers the handler until the sleep
+# returns, which is exactly the slow-stop failure the sibling plugin hit.
+trap 'exit 0' TERM INT
+
 while true; do
-    sleep 5
+    sleep 5 &
+    wait $!
     curr=$(uci -q get tailscale.settings.enabled)
 
-    # Sample both families once per poll. "ip rule list" defaults to IPv4, so
-    # every check below is done per-family — a v6-only clobber is invisible to a
-    # v4-only probe, and IPv6 coverage is exactly our edge over GL's IPv4-only
-    # ts_killswitch. An empty $r6 means IPv6 is compiled out / disabled (no v6
-    # rules can exist), which the ensure check relies on to avoid looping.
-    r4=$(ip -4 rule list 2>/dev/null)
-    r6=$(ip -6 rule list 2>/dev/null)
-
-    # Detect Tailscale disabled + our KS rules still installed (EITHER family) →
-    # teardown. Idempotent: keeps firing until teardown clears the rules (reapply
-    # does on its first invocation; subsequent polls see none and no-op). Match our
-    # rule at 5279 (current) OR 5280 (legacy, pre-5279 install mid-upgrade); GL's
-    # "iif br-lan blackhole" at 5280 has no "lookup 100" so it never matches.
-    if [ "$curr" != "1" ] && { echo "$r4" | grep -qE "52(79|80).*lookup 100" || \
-                               echo "$r6" | grep -qE "52(79|80).*lookup 100"; }; then
-        logger -t ts-fix "Tailscale disabled + KS rules present — running teardown"
+    # Detect Tailscale disabled while any ts-fix setting is still applied → teardown. Idempotent:
+    # keeps firing until teardown clears the state, and reapply's teardown resets exactly these
+    # four intent flags to 0, so a converged router reads them all 0 and every later poll no-ops.
+    #
+    # This reads intent rather than probing the kill switch itself, which makes it a strict
+    # superset of the RPDB-era rule probe it replaced: that one could only fire while the kill
+    # switch was armed. Neither kill-switch layer — the severed forwardings in flash-persisted
+    # firewall UCI, nor the priority-5279 rules and their table-100 route — is checked here: the
+    # ts-fix-ks check pass below owns both, in both directions, on every poll.
+    if [ "$curr" != "1" ] && uci -q show ts-fix.settings 2>/dev/null | \
+       grep -qE "\.(kill_switch|route_guest|advertise_exit_node|tailscale_ssh)='1'"; then
+        logger -t ts-fix "Tailscale disabled + ts-fix settings still applied — running teardown"
         /usr/bin/ts-fix-reapply
     fi
 
-    # Ensure (boot-window + clobber backstop): KS armed (kill_switch=1) + TS enabled
-    # but our 5279 br-lan rule missing in a family that should have it → re-assert via
-    # reapply (which installs the KS at its top, before any daemon wait). Fail-secure:
-    # only ever ADDS the KS, never removes. br-lan is the per-family proxy (reapply
-    # does both interfaces + families). The v6 arm is gated on $r6 being non-empty so
-    # an IPv6-disabled router doesn't loop reapply chasing a rule that can't exist.
-    if [ "$curr" = "1" ] && [ "$(uci -q get ts-fix.settings.kill_switch)" = "1" ]; then
-        need=0
-        echo "$r4" | grep -q "5279:.*iif br-lan.*lookup 100" || need=1
-        [ -n "$r6" ] && { echo "$r6" | grep -q "5279:.*iif br-lan.*lookup 100" || need=1; }
-        if [ "$need" = "1" ]; then
-            logger -t ts-fix "KS armed but 5279 br-lan rule missing — re-asserting via reapply"
+    # Kill Switch follows Custom Exit Node (v1.0.22, opt-in via
+    # ks_follow_exit_node=1): the KS mirrors GL's exit_node_ip UCI — armed when
+    # an exit node is configured, disarmed when the user clears it. Keyed on the
+    # durable UCI value only (design-C rule: never the daemon's ExitNodeID). The
+    # disarm direction exists ONLY in this opt-in mode; the default lifecycle
+    # still never disarms on exit-node removal. Note: on some pre-4.9 firmware
+    # GL may leave a stale exit_node_ip after disabling Custom Exit Node — in
+    # that case follow mode keeps the KS armed (blocked, not leaked; clear the
+    # Custom Exit Node selection to disarm).
+    if [ "$curr" = "1" ] && \
+       [ "$(uci -q get ts-fix.settings.ks_follow_exit_node)" = "1" ]; then
+        eip=$(uci -q get tailscale.settings.exit_node_ip)
+        ks=$(uci -q get ts-fix.settings.kill_switch)
+        if [ -n "$eip" ] && [ "$ks" != "1" ]; then
+            logger -t ts-fix "ks_follow_exit_node: exit node configured — arming kill switch"
+            uci set ts-fix.settings.kill_switch=1 && uci commit ts-fix
+            /usr/bin/ts-fix-reapply
+        elif [ -z "$eip" ] && [ "$ks" = "1" ]; then
+            logger -t ts-fix "ks_follow_exit_node: exit node cleared — disarming kill switch"
+            uci set ts-fix.settings.kill_switch=0 && uci commit ts-fix
             /usr/bin/ts-fix-reapply
         fi
+    fi
+
+    # Kill-switch consistency pass — the periodic enforcement point for both layers. Run on EVERY
+    # poll and deliberately NOT gated on armed intent, because the engine self-gates and its two
+    # branches are both needed here.
+    #
+    # Armed, it re-severs any lan/guest/iot -> uplink-class forwarding the firewall re-emitted or
+    # that appeared since the last pass, keeps the lan -> tailscale0 path present, and re-runs the
+    # runtime default-route invariant that catches an uplink the seed vocabulary does not name —
+    # committing and reloading only when something actually changed. It then re-asserts the rule
+    # layer (the priority-5279 rules, the table-100 route and the guest/iot source-rule swap),
+    # adding only what is missing, so a quiet poll writes nothing.
+    #
+    # Unarmed, it is write-free apart from what a lost disarm left behind: severed forwardings
+    # recorded with intent off, which it restores, and a rule layer or a source-rule swap of ours
+    # standing with intent off, which it removes. The first matters most — severed state is
+    # flash-persisted, so a lost disarm strands lan/guest/iot egress across reboots with nothing
+    # else coming to fix it. Gating this call on intent would silently disable that recovery path,
+    # since intent is already off by the time it is needed.
+    #
+    # No rc handling: the engine ERROR-logs its own failures on every attempt and the next poll is
+    # the retry, so a line here would only double the log volume every 5 seconds.
+    /usr/bin/ts-fix-ks check
+
+    # Daemon-settings retry: reapply's Running-wait can expire on cold boot (modem still coming
+    # up, NTP not yet synced) and boot's other ifup reapplies are swallowed by its flock — the
+    # flag is reapply's own "I could not apply daemon-level settings" signal. Without this the
+    # boot pass is the only chance those settings get, which is how two field routers lost their
+    # exit-node advertisement across a power cycle. Reapply itself removes the flag on any
+    # successful pass, so this fires at most until one of them completes.
+    #
+    # Steady-state cost obeys the no-per-poll-CLI constraint: the status CLI (a ~15MB Go spawn)
+    # runs ONLY while the flag exists, so a quiet router pays one [ -f ] stat per poll and nothing
+    # else. A flag left by a pass whose intent has since been turned off is dropped here rather
+    # than probed, so the CLI is never reached for settings nobody wants applied. A status call that
+    # hangs is cut off after 10s and reads as not Running, as a daemon that is down does: the retry
+    # waits for a later poll.
+    #
+    # The intent set is exactly the settings reapply applies AFTER its daemon wait. hide_ts_domain
+    # is deliberately NOT among them: reapply strips the search domain before the wait, needing no
+    # daemon state, so it can never be what is pending — including it would hold the flag (and the
+    # probe with it) alive for a router that has nothing daemon-level left to do.
+    if [ -f /tmp/ts-fix-daemon-pending ] && [ "$curr" = "1" ]; then
+        if uci -q show ts-fix.settings 2>/dev/null | \
+           grep -qE "\.(advertise_exit_node|tailscale_ssh|route_guest)='1'"; then
+            if pgrep tailscaled >/dev/null 2>&1 && \
+               [ "$(timeout 10 /usr/sbin/tailscale status --json 2>/dev/null | jsonfilter -e '@.BackendState' 2>/dev/null)" = "Running" ]; then
+                logger -t ts-fix "tailscaled now Running - retrying pending daemon-level settings via reapply"
+                /usr/bin/ts-fix-reapply
+            fi
+        else
+            rm -f /tmp/ts-fix-daemon-pending 2>/dev/null
+        fi
+    fi
+
+    # TS search-domain drift (v1.0.22): the user asked us to hide the tailnet suffix but GL has
+    # written it back into dnsmasq's advertised domain → delegate to reapply, which owns the
+    # strip logic. This is the load-bearing enforcement point for the feature: on 4.9 GL's
+    # start_dns_poller() is DETACHED and keeps re-asserting for up to ~15 attempts (2s→30s
+    # backoff) AFTER "gl_tailscale restart" has already exited, so reapply's process wait cannot
+    # cover it. That poller breaks after its first successful write, so this converges rather
+    # than ping-ponging. Cheap: one uci read per poll, and the grep only runs when the feature
+    # is enabled. The pattern matches a bare "ts.net" as well as "*.ts.net" but not a lookalike
+    # such as "notts.net" or "ts.net.example.com".
+    if [ "$curr" = "1" ] && \
+       [ "$(uci -q get ts-fix.settings.hide_ts_domain)" = "1" ] && \
+       uci -q get "dhcp.@dnsmasq[0].domain" 2>/dev/null | \
+           grep -qE '(^|[[:space:]])([^[:space:]]*\.)?ts\.net([[:space:]]|$)'; then
+        logger -t ts-fix "tailnet search domain reappeared in dnsmasq config — re-asserting via reapply"
+        /usr/bin/ts-fix-reapply
+    fi
+
+    # Exit-node daemon reconcile (v1.0.22): GL's UCI is authoritative. On buggy
+    # tiny Tailscale builds (ts_omit_ipnbus, before the upstream fix 2026-06-04)
+    # GL's disable path can leave the daemon's ExitNodeID stuck — the router
+    # keeps routing through an exit node the user turned off. Detected cheaply,
+    # no CLI spawn: UCI exit_node_ip empty while table 52 still carries a
+    # default route (the daemon-side marker that an exit node is in use —
+    # verified live: present on an exit-node client, absent on a server).
+    # Debounced to two consecutive polls so a legitimate disable transition
+    # (GL clears UCI a few seconds before the daemon catches up) doesn't draw a
+    # redundant call, and retried while stuck — the upstream failure is
+    # intermittent, one push may not land. Consequence, by design: an exit node
+    # set manually via "tailscale set --exit-node=<ip>" (bypassing GL's UI) is
+    # reconciled away too. GL's UI is the supported control surface, and
+    # enforcing it also clears the documented stale-exit-node startup blackout.
+    if [ "$curr" = "1" ] && \
+       [ -z "$(uci -q get tailscale.settings.exit_node_ip)" ] && \
+       ip -4 route show table 52 2>/dev/null | grep -q "^default" && \
+       pgrep tailscaled >/dev/null 2>&1; then
+        stuck_polls=$((stuck_polls + 1))
+        if [ "$stuck_polls" -ge 2 ]; then
+            logger -t ts-fix "Exit node cleared in GL config but daemon still routing (table 52 default) — reconciling"
+            timeout 10 /usr/sbin/tailscale set --exit-node= 2>/dev/null
+            stuck_polls=0
+        fi
+    else
+        stuck_polls=0
+    fi
+
+    # SET-direction mirror of the block above (v1.0.22): GL's UCI carries an exit node but
+    # the daemon is not routing one (no table 52 default) — a dropped/failed SET push. The
+    # reapply path retries only when another reapply event arrives; without this block a
+    # dropped SET persists silently, and with the kill switch off that means traffic keeps
+    # egressing the real WAN while the UI shows an exit node selected. Longer debounce than
+    # CLEAR (3 polls ≈ 15s) so a normal engage transition never draws a push, and the one
+    # CLI spawn (BackendState check) happens only after the debounce in this already-rare
+    # state — a daemon that is not Running (starting, NeedsLogin) is skipped and re-checked, and
+    # so is one whose status call times out (cut off after 10s, it reads as not Running).
+    if [ "$curr" = "1" ] && \
+       [ -n "$(uci -q get tailscale.settings.exit_node_ip)" ] && \
+       ! ip -4 route show table 52 2>/dev/null | grep -q "^default" && \
+       pgrep tailscaled >/dev/null 2>&1; then
+        set_stuck_polls=$((set_stuck_polls + 1))
+        if [ "$set_stuck_polls" -ge 3 ]; then
+            if [ "$(timeout 10 /usr/sbin/tailscale status --json 2>/dev/null | jsonfilter -e '@.BackendState' 2>/dev/null)" = "Running" ]; then
+                eip=$(uci -q get tailscale.settings.exit_node_ip)
+                logger -t ts-fix "Exit node set in GL config but daemon not routing one (no table 52 default) — reconciling"
+                timeout 10 /usr/sbin/tailscale set --exit-node="$eip" 2>/dev/null
+            fi
+            set_stuck_polls=0
+        fi
+    else
+        set_stuck_polls=0
     fi
 
 done

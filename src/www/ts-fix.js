@@ -258,7 +258,9 @@ function initTooltip() {
 
 var TIPS = {
   exitNode: 'Advertise this router as a Tailscale exit node so remote devices can route all traffic through it. Requires "Allow Remote Access WAN" to be enabled above.',
-  killSwitch: 'Routing-level kill switch - Uses policy routing to block all LAN/Guest traffic from reaching the WAN directly whenever it is enabled, so your real IP cannot leak if the exit-node tunnel drops, tailscaled crashes, or the daemon restarts. Stays armed until you turn it off or disable Tailscale - removing the exit node does NOT disable it (traffic stays blocked, fail-secure).',
+  killSwitch: 'Two-layer kill switch - Closes the firewall forwardings from LAN, Guest and IoT to the WAN, and adds policy routing that blocks the same traffic, so while it is enabled these devices reach the internet only through the exit-node tunnel and your real IP cannot leak if the tunnel drops, tailscaled crashes, or the daemon restarts. Stays armed until you turn it off or disable Tailscale - removing the exit node does NOT disable it (traffic stays blocked, fail-secure) unless "Kill Switch Follows Exit Node" below is enabled.',
+  ksFollow: 'Automatically arm the Kill Switch whenever a Custom Exit Node is configured, and disarm it when the exit node selection is cleared. With this on, turning Custom Exit Node off also turns the Kill Switch off, and traffic uses your normal connection until you pick a new exit node. To switch exit nodes without a gap, leave this off. Tracks GL\'s stored Custom Exit Node setting (applied within ~5 seconds). Leave off to control the Kill Switch manually. Note: on some pre-4.9 firmware GL can leave a stale exit-node value after disabling Custom Exit Node - if the Kill Switch arms unexpectedly, clear the Custom Exit Node selection or turn this off.',
+  hideTsDomain: 'Stops the router advertising your Tailscale tailnet name (for example x.ts.net) to devices on your network, and keeps your own local domain instead. Tailnet names still resolve - only the advertised search-domain hint is removed. Useful if the tailnet name breaks local .lan name resolution, or if you would rather not hand connected devices a hint that Tailscale is in use.',
   routeGuest: 'Extends GL\'s "Allow Remote Access" to the Guest network. Adds Guest\u2194Tailscale forwardings and advertises the guest subnet to your tailnet.',
   tailscaleSsh: 'Enable Tailscale\'s ACL-based SSH authentication for this router. Most users don\'t need this \u2014 SSH to the router\'s Tailscale IP already works through the normal SSH daemon (Dropbear) without any extra setup. Enable this only if you specifically want identity-based access controlled by a Tailscale SSH ACL rule (Access Controls \u2192 Tailscale SSH tab). While enabled, tailscaled takes over port 22 for tailnet-origin traffic, which breaks SSH from LAN clients that reach the router via Tailscale subnet routing. In that case, run Dropbear on an alternate port (System \u2192 Administration \u2192 SSH Access) to keep a path open for both Tailscale and LAN clients.',
   version: 'Manage Tailscale binary version. Combined binaries provided by admonstrator/glinet-tailscale-updater.'
@@ -324,9 +326,15 @@ function buildSection() {
   // Kill Switch (extends native Custom Exit Node — shown when exit node client mode is active)
   section.appendChild(createToggleRow('kill-switch', 'Kill Switch', TIPS.killSwitch, {hidden: true}));
 
+  // Kill Switch follows Custom Exit Node (opt-in convenience — watchdog-enforced)
+  section.appendChild(createToggleRow('ks-follow', 'Kill Switch Follows Exit Node', TIPS.ksFollow, {hidden: true}));
+
   // Advertise as Exit Node (new server-side functionality)
   section.appendChild(createToggleRow('exit-node', 'Advertise as Exit Node', TIPS.exitNode));
   section.appendChild(createToggleRow('tailscale-ssh', 'Enable Tailscale SSH', TIPS.tailscaleSsh));
+
+  // Hide Tailscale Search Domain (opt-in — stops the tailnet suffix reaching LAN clients)
+  section.appendChild(createToggleRow('hide-ts-domain', 'Hide Tailscale Search Domain', TIPS.hideTsDomain));
 
   // WAN warning (shown when exit node ON but Allow Remote Access WAN is OFF)
   var wanWarn = document.createElement('div');
@@ -335,6 +343,16 @@ function buildSection() {
   wanWarn.style.cssText = 'color:#e6a23c;font-size:12px;padding:0 15px 10px;';
   wanWarn.textContent = '\u26a0 Enable "Allow Remote Access WAN" above and click Apply for exit node traffic to flow.';
   section.appendChild(wanWarn);
+
+  // Apply-failure notice. The error path reverts the toggles to their pre-Apply values, but a
+  // silent revert on a safety control is indistinguishable from "nothing happened": a user who
+  // just switched the Kill Switch on, clicked Apply, and saw the switch sitting off can as
+  // easily read that as "it was already off" as "my change failed". Say it explicitly.
+  var applyErr = document.createElement('div');
+  applyErr.id = 'ts-fix-apply-err';
+  applyErr.className = 'ts-fix-hidden';
+  applyErr.style.cssText = 'color:#f56c6c;font-size:12px;padding:0 15px 10px;';
+  section.appendChild(applyErr);
 
   // Version info row
   var verRow = document.createElement('div');
@@ -374,6 +392,7 @@ function buildSection() {
 var state = {
   advertise_exit_node: false,
   kill_switch: false,
+  ks_follow_exit_node: false,
   route_guest: false,
   tailscale_ssh: false,
   ts_enabled: false,
@@ -393,6 +412,10 @@ var state = {
 var updateState = {};
 var pluginState = {};
 var pendingChanges = {};
+// Pre-change values for the error-revert path, recorded by toggleSetting at the
+// moment a key is first toggled. Must be captured there, not at Apply time —
+// see the comment in toggleSetting.
+var pendingPrev = {};
 
 function setToggle(id, on, disabled) {
   var el = document.getElementById('ts-fix-toggle-' + id);
@@ -443,12 +466,17 @@ function refreshUI() {
   // via the "Run Exit Node" toggle in its Tailscale admin UI.
   showRow('exit-node', state.ts_enabled && !state.firmware_49_plus);
   showRow('route-guest', state.ts_enabled);
+  showRow('hide-ts-domain', state.ts_enabled);
   showRow('tailscale-ssh', state.ts_enabled);
   // Show kill switch when it's already on (so an armed KS is ALWAYS reversible —
   // design C keeps it armed even with no exit node, so the toggle must stay
   // reachable or the user could be stranded), when an exit node is configured
   // (backend), or when toggled on in GL's UI (pre-Apply).
-  showRow('kill-switch', state.ts_enabled && (state.kill_switch || state.exit_node_ip !== '' || isGlExitNodeEnabled()));
+  var ksRowVisible = state.ts_enabled && (state.kill_switch || state.exit_node_ip !== '' || isGlExitNodeEnabled());
+  showRow('kill-switch', ksRowVisible);
+  // Follow-mode option rides with the KS row, and also stays visible while
+  // enabled (its watchdog behavior is active regardless of exit-node state).
+  showRow('ks-follow', ksRowVisible || (state.ts_enabled && state.ks_follow_exit_node));
 
   // Post-upgrade KS re-enable hint on 4.9+ (evaluated after row visibility)
   ensureMigrationHint();
@@ -475,8 +503,16 @@ function refreshUI() {
 
   setToggle('exit-node', state.advertise_exit_node, notReady);
   setToggle('route-guest', state.route_guest, notReady);
+  setToggle('hide-ts-domain', state.hide_ts_domain, notReady);
   setToggle('tailscale-ssh', state.tailscale_ssh, notReady);
-  setToggle('kill-switch', state.kill_switch, notReady);
+  // Kill Switch stays operable while tailscaled is down (claim-6, v1.0.22):
+  // the KS is kernel policy routing, deliberately daemon-independent, and the
+  // RPC path behind it only needs Tailscale enabled in UCI — no CLI calls. A
+  // user sitting dark behind an armed KS with a dead daemon must be able to
+  // disarm (or arm) from this page instead of being stranded. Same for the
+  // follow-mode preference (a pure UCI flag the watchdog enforces).
+  setToggle('kill-switch', state.kill_switch, !state.ts_enabled);
+  setToggle('ks-follow', state.ks_follow_exit_node, !state.ts_enabled);
 
   // WAN warning: show when exit node enabled but Allow Remote Access WAN is off.
   // Hidden on 4.9+ since the Advertise as Exit Node toggle itself is hidden there.
@@ -503,7 +539,11 @@ function refreshUI() {
 
     if (updateState.latest_version && updateState.latest_version !== 'checking...'
         && updateState.update_available) {
-      var arrow = document.createTextNode(' \u2192 ' + updateState.latest_version + ' ');
+      // Same base version but a newer build suffix upstream (assets replaced
+      // in place) \u2014 label it so "1.98.5 \u2192 1.98.5" doesn't look like a glitch.
+      var latestLabel = updateState.latest_version
+        + (updateState.is_rebuild ? ' (rebuild)' : '');
+      var arrow = document.createTextNode(' \u2192 ' + latestLabel + ' ');
       verEl.appendChild(arrow);
 
       var btn = document.createElement('button');
@@ -756,8 +796,50 @@ function refreshPluginBadge() {
 
 // -- Actions --
 
+// Apply-failure notice helpers. textContent only, never innerHTML — the message can carry an
+// err_msg string that originates in the RPC layer, and this section already had one XSS fix.
+function showNotice(text) {
+  var el = document.getElementById('ts-fix-apply-err');
+  if (!el) return;
+  el.textContent = text;
+  el.className = '';
+}
+
+function showApplyError(reason) {
+  // The em dash separates the router's own message from our sentence: run together they read
+  // as one sentence from the router, and an err_msg that ends without punctuation ran straight
+  // into "The switches above...".
+  showNotice('⚠ Settings were NOT applied: ' + reason
+    + ' — The switches above have been put back to their previous state.');
+}
+
+// Kill Switch refused because the router is not in Router mode. Not an Apply failure: every
+// other setting in the same Apply was written, so only the Kill Switch toggle is reverted and
+// the notice says so rather than claiming nothing was applied.
+function showKsModeRefusal(reason) {
+  showNotice('⚠ ' + reason
+    + ' — The Kill Switch has been put back to its previous state.');
+}
+
+function clearApplyError() {
+  var el = document.getElementById('ts-fix-apply-err');
+  if (!el) return;
+  el.textContent = '';
+  el.className = 'ts-fix-hidden';
+}
+
 function toggleSetting(key) {
   var newVal = !state[key];
+  // Any new interaction invalidates a previous failure notice — leaving it up next to controls
+  // the user has since changed would misdescribe the current state.
+  clearApplyError();
+  // Record the pre-change value HERE, before the next line overwrites it. The
+  // error-revert path in applyPendingChanges restores from this; reading state[k]
+  // at Apply time returns the already-toggled value, which makes the revert a
+  // silent no-op and leaves the UI asserting a safety state the backend rejected.
+  // Only the first toggle of a key records, so an on→off→on sequence still reverts
+  // to the value the user started from.
+  if (!(key in pendingPrev)) pendingPrev[key] = state[key];
   state[key] = newVal;
   pendingChanges[key] = newVal;
   refreshUI();
@@ -781,21 +863,47 @@ function applyPendingChanges() {
   var keys = Object.keys(pendingChanges);
   if (keys.length === 0) return;
 
+  // Pre-change values for the error-revert path, captured in toggleSetting when
+  // each key was first toggled. Replacing the original negation (!params[k]) makes
+  // the revert type-agnostic — the negation only ever worked because every param
+  // happens to be a boolean. Fix contributed by @slipstyle in PR #13; sourcing the
+  // values from toggleSetting rather than from state[k] here is what makes it fire.
   var params = {};
-  keys.forEach(function(k) { params[k] = pendingChanges[k]; });
+  var prevValues = pendingPrev;
+  keys.forEach(function(k) {
+    params[k] = pendingChanges[k];
+  });
   pendingChanges = {};
+  pendingPrev = {};
 
   rpc('ts-fix', 'set_config', params).then(function(res) {
     if (res.err_code) {
-      // Revert on error
-      keys.forEach(function(k) { state[k] = !params[k]; });
+      // Revert on error, then say so. refreshUI() runs first because it rewrites the rows;
+      // the notice is set afterwards so it survives that pass.
+      keys.forEach(function(k) { state[k] = prevValues[k]; });
       refreshUI();
+      showApplyError(res.err_msg || ('the router reported error ' + res.err_code + '.'));
       return;
     }
+    if (res.ks_mode_refused) {
+      // Partial refusal: the router is not in Router mode, so the Kill Switch was not enabled
+      // while everything else in this Apply was. Revert that one key only — a blanket revert
+      // would misreport settings the router did write. Same ordering as the error path above:
+      // refreshUI() rewrites the rows, so the notice is set after it.
+      if ('kill_switch' in prevValues) state.kill_switch = prevValues.kill_switch;
+      refreshUI();
+      showKsModeRefusal(res.ks_mode_msg || 'The Kill Switch requires Router mode.');
+      setTimeout(fetchConfig, 500);
+      return;
+    }
+    clearApplyError();
     setTimeout(fetchConfig, 500);
   }).catch(function() {
-    keys.forEach(function(k) { state[k] = !params[k]; });
+    keys.forEach(function(k) { state[k] = prevValues[k]; });
     refreshUI();
+    // Covers a transport failure AND a JSON-RPC error, which rpc() turns into a throw —
+    // so this must not claim the router was silent, because sometimes it answered.
+    showApplyError('the request to the router failed.');
   });
 }
 
@@ -1049,7 +1157,9 @@ function inject() {
     'exit-node': 'advertise_exit_node',
     'route-guest': 'route_guest',
     'tailscale-ssh': 'tailscale_ssh',
-    'kill-switch': 'kill_switch'
+    'kill-switch': 'kill_switch',
+    'ks-follow': 'ks_follow_exit_node',
+    'hide-ts-domain': 'hide_ts_domain'
   };
 
   Object.keys(toggles).forEach(function(id) {

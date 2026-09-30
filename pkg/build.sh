@@ -4,6 +4,8 @@
 # https://github.com/RemoteToHome-io/gl-tailscale-fix
 # Usage: ./pkg/build.sh [version]
 set -eu
+# Pinned: a 002 umask left each archive's root directory 0775, and files not made by install 0664.
+umask 022
 
 for cmd in tar gzip sed install du cut; do
 	command -v "$cmd" >/dev/null 2>&1 || {
@@ -48,10 +50,13 @@ install -m 644 "$ROOT_DIR/src/config/ts-fix" "$DATA/etc/config/ts-fix.default"
 # Hotplug
 install -d "$DATA/etc/hotplug.d/iface"
 install -m 755 "$ROOT_DIR/src/hotplug/20-ts-fix" "$DATA/etc/hotplug.d/iface/20-ts-fix"
+install -m 755 "$ROOT_DIR/src/hotplug/10-ts-fix-ks" "$DATA/etc/hotplug.d/iface/10-ts-fix-ks"
 
 # Procd init script (UCI reload trigger)
 install -d "$DATA/etc/init.d"
 install -m 755 "$ROOT_DIR/src/init.d/ts-fix" "$DATA/etc/init.d/ts-fix"
+# Pre-firewall kill-switch pass (plain rc.common one-shot at START=18, not procd)
+install -m 755 "$ROOT_DIR/src/init.d/ts-fix-preboot" "$DATA/etc/init.d/ts-fix-preboot"
 
 # Nginx config + Lua filters
 install -d "$DATA/etc/nginx/gl-conf.d"
@@ -73,6 +78,7 @@ install -d "$DATA/usr/bin"
 install -m 755 "$ROOT_DIR/src/scripts/ts-fix-update" "$DATA/usr/bin/ts-fix-update"
 install -m 755 "$ROOT_DIR/src/scripts/ts-fix-reapply" "$DATA/usr/bin/ts-fix-reapply"
 install -m 755 "$ROOT_DIR/src/scripts/ts-fix-watchdog" "$DATA/usr/bin/ts-fix-watchdog"
+install -m 755 "$ROOT_DIR/src/scripts/ts-fix-ks" "$DATA/usr/bin/ts-fix-ks"
 
 # Sysupgrade persistence
 install -d "$DATA/lib/upgrade/keep.d"
@@ -84,17 +90,22 @@ CTRL="$BUILD_DIR/control"
 sed "s/{{VERSION}}/$VERSION/" "$SCRIPT_DIR/control" > "$CTRL/control"
 install -m 755 "$SCRIPT_DIR/postinst" "$CTRL/postinst"
 install -m 755 "$SCRIPT_DIR/prerm" "$CTRL/prerm"
+install -m 755 "$SCRIPT_DIR/postrm" "$CTRL/postrm"
 
 # -- Assemble ipk --
 
 echo "2.0" > "$BUILD_DIR/debian-binary"
 
-(cd "$CTRL" && tar czf "$BUILD_DIR/control.tar.gz" .)
-(cd "$DATA" && tar czf "$BUILD_DIR/data.tar.gz" .)
+# --owner/--group=0 --numeric-owner: without them tar records the build
+# machine's UID (the CI runner's 1001 on release builds) and opkg installs
+# the files with that ownership on the router — verified live: pre-v1.0.22
+# release files on the MT3000 were owned 1001:1001.
+(cd "$CTRL" && tar czf "$BUILD_DIR/control.tar.gz" --owner=0 --group=0 --numeric-owner .)
+(cd "$DATA" && tar czf "$BUILD_DIR/data.tar.gz" --owner=0 --group=0 --numeric-owner .)
 
 IPK="$OUT_DIR/${PKG_NAME}_${VERSION}_all.ipk"
 # OpenWrt opkg expects tar-based IPK (not ar-based .deb style)
-(cd "$BUILD_DIR" && tar czf "$IPK" ./debian-binary ./control.tar.gz ./data.tar.gz)
+(cd "$BUILD_DIR" && tar czf "$IPK" --owner=0 --group=0 --numeric-owner ./debian-binary ./control.tar.gz ./data.tar.gz)
 
 # Show result
 SIZE=$(du -h "$IPK" | cut -f1)

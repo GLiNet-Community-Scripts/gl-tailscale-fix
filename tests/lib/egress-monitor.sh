@@ -12,10 +12,28 @@
 #
 # Classification (per family):
 #   ok      = egress equals the tunnel baseline (normal tunnelling)
-#   blocked = no response within MAXTIME (KS holding — also the desired result)
+#   blocked = no usable response (KS holding — also the desired result)
 #   LEAK    = some other public IP answered (real address exposed)
 # If no tunnel baseline is supplied for a family, ANY response on that family is
 # treated as a LEAK and no-response as ok (correct privacy stance).
+#
+# TWO-LAYER KILL SWITCH — what "blocked" looks like on the wire depends on which
+# layer stops the packet, while the leak semantics above do NOT. Neither layer
+# touches this client's own routes:
+#   rule layer  once the exit node's route is gone, the router's priority-5279
+#               rules send the forwarded packet to an "unreachable default" in
+#               table 100, and the router answers with an ICMP host unreachable;
+#   zone layer  the router's lan/guest/iot -> uplink forwardings are severed, so
+#               the packet dies in its forward chain — a rejection or a silent
+#               drop.
+# Two consequences for this instrument, both benign:
+#   1. have_route()'s "no route at all" fast-skip is never a kill-switch signal:
+#      an armed router leaves this client its route, so each armed sample really
+#      does attempt a connection. Cadence is bounded by MAXTIME either way, and an
+#      ICMP unreachable or a REJECT answers faster than a timeout.
+#   2. "blocked" therefore means "no usable answer" rather than "no route", which
+#      is what the verdict logic already required. A LEAK is still, and only, a
+#      non-tunnel public IP that actually answered.
 #
 # Env: DURATION INTERVAL LABEL TUNNEL_V4 TUNNEL_V6 MAXTIME OUTDIR CSV JSON
 #      V4_URLS V6_URLS
@@ -43,6 +61,20 @@ stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 csv="${CSV:-$OUTDIR/${stamp}-${LABEL}-egress.csv}"
 json="${JSON:-$OUTDIR/${stamp}-${LABEL}-egress.json}"
 ts_start="$(date +%s)"
+
+# Client routing precondition, recorded into the artifact.
+#
+# A leak detector running on a multi-homed client can be silently wrong: with a second default
+# route present, probes may egress a path other than the one under test and return a public IP
+# that is neither the tunnel baseline nor a timeout — which this script scores as LEAK. The
+# realistic way that happens mid-run is NetworkManager reconnecting a wifi interface it had
+# dropped, precisely because an armed kill switch makes the wired path look offline to it.
+#
+# Captured at start AND end so a change during the run lands in the JSON instead of quietly
+# rewriting the verdict. Expected shape for a valid run: exactly one v4 and one v6 default, both
+# on the interface facing the router under test.
+snapshot_routes() { { ip -4 route show default; ip -6 route show default; } 2>/dev/null | tr '\n' ';'; }
+routes_start="$(snapshot_routes)"
 
 valid_ip() {
   case "$1" in
@@ -75,6 +107,12 @@ fetch() {
 
 have_route() {
   # $1 = -4|-6 ; $2 = probe dest ; returns 0 if ANY non-unreachable route exists.
+  # Under the zone kill switch this is true even while armed (severing a forwarding
+  # does not touch the client's routes), so it is now purely a no-connectivity
+  # fast-skip rather than a KS-state signal — see the header note. It is kept
+  # because it still saves a full MAXTIME wait on a family the client cannot use
+  # at all, and because a false "blocked" from skipping a usable path would hide
+  # a leak.
   # We deliberately do NOT require a global v6 source. GL hands clients a ULA, and
   # a ULA can be NAT6'd straight to the real WAN when the tunnel drops — i.e. a ULA
   # source can still LEAK. The earlier "require global v6 src" optimization produced
@@ -107,7 +145,7 @@ printf 'ts_epoch,ts_iso,v4_ip,v4_class,v6_ip,v6_class\n' > "$csv"
   echo "[egress-monitor] artifact=$csv"
 } >&2
 
-leak4=0; leak6=0; samples=0; first_leak=""; saw_event=0
+leak4=0; leak6=0; samples=0; first_leak=""; saw_event=0; saw_ok=0
 tmp4="$(mktemp)"; tmp6="$(mktemp)"
 trap 'rm -f "$tmp4" "$tmp6"' EXIT
 end=$(( ts_start + DURATION ))
@@ -124,6 +162,12 @@ while [ "$(date +%s)" -lt "$end" ]; do
   samples=$(( samples + 1 ))
   if [ "$c4" = "LEAK" ]; then leak4=$(( leak4 + 1 )); [ -z "$first_leak" ] && first_leak="$now"; fi
   if [ "$c6" = "LEAK" ]; then leak6=$(( leak6 + 1 )); [ -z "$first_leak" ] && first_leak="$now"; fi
+  # Positive control: did the protected path EVER work inside this window? Without at
+  # least one "ok" sample there is no way to tell "the kill switch blocked it" from
+  # "this client never had egress at all" — and an all-blocked run with no tunnel
+  # baseline satisfies saw_event on its very first sample, so it would score PASS
+  # having exercised nothing.
+  [ "$c4" = "ok" ] && saw_ok=1
   # Did we actually observe the tunnel-down event? (v4 leaving "ok", or any v6 leak.)
   { [ "$c4" != "ok" ] || [ "$c6" = "LEAK" ]; } && saw_event=1
   printf '[%s] v4=%-15s(%s)  v6=%-25s(%s)\n' "$iso" "${v4:-none}" "$c4" "${v6:-none}" "$c6" >&2
@@ -136,11 +180,20 @@ done
 # 300s countdown expired before the operator acted and the monitor falsely PASSed.)
 if [ "$leak4" -gt 0 ] || [ "$leak6" -gt 0 ]; then
     verdict=LEAK
-elif [ "$saw_event" = "1" ]; then
+elif [ "$saw_ok" = "1" ] && [ "$saw_event" = "1" ]; then
     verdict=PASS
 else
     verdict=INCONCLUSIVE
 fi
+routes_end="$(snapshot_routes)"
+if [ "$routes_start" != "$routes_end" ]; then
+  echo "[egress-monitor] WARNING: client default routes CHANGED during the run." >&2
+  echo "[egress-monitor]   start: $routes_start" >&2
+  echo "[egress-monitor]   end  : $routes_end" >&2
+  echo "[egress-monitor]   Treat this run's verdict as suspect — probes may have egressed a" >&2
+  echo "[egress-monitor]   path other than the one under test. Re-run with a stable client." >&2
+fi
+
 cat > "$json" <<JSON
 {
   "label": "$LABEL",
@@ -154,6 +207,10 @@ cat > "$json" <<JSON
   "leak_v4_count": $leak4,
   "leak_v6_count": $leak6,
   "tunnel_down_observed": $saw_event,
+  "tunnel_baseline_observed": $saw_ok,
+  "client_default_routes_start": "$routes_start",
+  "client_default_routes_end": "$routes_end",
+  "client_routes_stable": $( [ "$routes_start" = "$routes_end" ] && echo true || echo false ),
   "first_leak_epoch": "$first_leak",
   "csv": "$csv",
   "verdict": "$verdict"

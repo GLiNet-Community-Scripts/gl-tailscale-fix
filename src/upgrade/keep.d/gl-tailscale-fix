@@ -10,7 +10,10 @@
 # Plugin components
 /usr/lib/oui-httpd/rpc/ts-fix
 /etc/init.d/ts-fix
+/etc/init.d/ts-fix-preboot
+/etc/hotplug.d/iface/10-ts-fix-ks
 /etc/hotplug.d/iface/20-ts-fix
+/usr/bin/ts-fix-ks
 /usr/bin/ts-fix-reapply
 /usr/bin/ts-fix-watchdog
 /usr/bin/ts-fix-update
@@ -20,9 +23,17 @@
 # This file (self-preservation for next sysupgrade)
 /lib/upgrade/keep.d/gl-tailscale-fix
 
-# Procd service symlinks (auto-start after sysupgrade)
+# Procd service symlink (auto-start after sysupgrade). Only the S symlink exists —
+# the init script declares no STOP=, so enable never creates a K symlink.
+# S99 matches START=99 in the init script: the zone kill switch is applied from flash by
+# the firewall's own boot, so nothing here needs to precede netifd any more.
 /etc/rc.d/S99ts-fix
-/etc/rc.d/K01ts-fix
+
+# Pre-firewall kill-switch pass symlink (S18 = START=18 in /etc/init.d/ts-fix-preboot; no STOP=,
+# so again only the S link exists). This one MUST survive a firmware upgrade: the first boot after
+# a keep-settings upgrade — when GL's first-boot defaults re-enable the severed forwardings — is
+# the boot the preboot pass exists for, and without the link it would not run on it.
+/etc/rc.d/S18ts-fix-preboot
 
 # Tailscale binaries (preserved if updated via Version Manager)
 /usr/sbin/tailscaled

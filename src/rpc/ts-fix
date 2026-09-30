@@ -18,11 +18,13 @@ local TS_CONFIG = "tailscale"
 -- Version check cache TTL (72 hours)
 local CACHE_TTL = 259200
 
--- Cached tailscale version. Invalidated per-worker when the tailscaled
--- binary mtime changes (i.e. the Version Manager ran an update/restore).
--- Multiple nginx workers each hold their own cache; mtime check ensures
--- every worker re-reads after an update, without a nginx restart.
+-- Cached tailscale version (base for display, full string for update
+-- comparison). Invalidated per-worker when the tailscaled binary mtime
+-- changes (i.e. the Version Manager ran an update/restore). Multiple nginx
+-- workers each hold their own cache; mtime check ensures every worker
+-- re-reads after an update, without a nginx restart.
 local cached_ts_version = nil
+local cached_ts_version_full = nil
 local cached_ts_version_mtime = 0
 
 -- Helper: strip version suffix (e.g. "1.94.2-tiny.by.admon.1187" → "1.94.2")
@@ -54,15 +56,29 @@ end
 
 -- Helper: get installed tailscale version. Caches per-worker and
 -- invalidates on tailscaled binary mtime change (Version Manager updates).
-local function get_ts_version()
+-- Both forms come from the same "tailscale version" first line, which on
+-- tiny builds is the full suffixed string (verified live on MT3000:
+-- "1.98.8-tiny.by.admon.1320").
+local function refresh_ts_version()
     local mtime = file_mtime("/usr/sbin/tailscaled")
     if cached_ts_version and mtime > 0 and mtime == cached_ts_version_mtime then
-        return cached_ts_version
+        return
     end
     local ver = exec("/usr/sbin/tailscale version 2>/dev/null")
-    cached_ts_version = ver and base_ver(ver:match("^(%S+)")) or "unknown"
+    local first = ver and ver:match("^(%S+)") or nil
+    cached_ts_version_full = first or "unknown"
+    cached_ts_version = first and base_ver(first) or "unknown"
     cached_ts_version_mtime = mtime
+end
+
+local function get_ts_version()
+    refresh_ts_version()
     return cached_ts_version
+end
+
+local function get_ts_version_full()
+    refresh_ts_version()
+    return cached_ts_version_full
 end
 
 -- Helper: check if a cache file is stale (older than CACHE_TTL seconds)
@@ -81,15 +97,23 @@ local function is_cache_stale(path)
 end
 
 -- Helper: run a command and return exit code
+-- Reads the shell's own $? out of stdout rather than trusting proc:wait().
+--
+-- On GL's lua-nginx build a NONZERO exit was measured still reading as ok
+-- (gl-zerotier-fix U1 session, MT3000 4.9.0 / nginx 1.26.1, 2026-08-08: an
+-- rc-based boolean reported transport_route4:true against an empty table 310).
+-- Under that semantic every caller here gets a wrong-positive — which would
+-- silently disable the pgrep guard below and reintroduce the OOM-amplification
+-- path it exists to prevent, on exactly the 512MB routers that need it.
+--
+-- Appending the status is correct under EITHER wait() semantic, so this does not
+-- depend on which build is running and needs no firmware gate. The braces keep
+-- the caller's redirections scoped to their own command.
 local function exec_rc(cmd)
-    local r = ngx.pipe.spawn({"sh", "-c", cmd})
-    if r then
-        r:stdout_read_all()
-        local ok, reason, code = r:wait()
-        if ok then return 0 end
-        return code or 1
-    end
-    return 1
+    local out = exec("{ " .. cmd .. " ; } ; echo __RC=$?")
+    if not out then return 1 end
+    local rc = out:match("__RC=(%d+)%s*$")
+    return tonumber(rc) or 1
 end
 
 -- Helper: get tailscale status JSON
@@ -97,8 +121,14 @@ end
 -- immediately instead of spawning a ~60MB Go process that hangs for 3s
 -- until timeout. Prevents OOM amplification loops on 512MB routers where
 -- dead tailscaled + piling CLI processes exhaust all memory.
+-- No -x: BusyBox pgrep -x anchors on the FULL cmdline, so it never matches
+-- a path-invoked daemon ("/usr/sbin/tailscaled --port ..." != "tailscaled";
+-- measured live, MT3000 BusyBox 1.33.2). The old wait()-trusting exec_rc
+-- masked that by returning 0 for everything; with honest exit codes the -x
+-- form would report the daemon dead while it runs. Substring form matches
+-- the shell scripts' established idiom.
 local function tailscale_status()
-    if exec_rc("pgrep -x tailscaled >/dev/null 2>&1") ~= 0 then
+    if exec_rc("pgrep tailscaled >/dev/null 2>&1") ~= 0 then
         return nil
     end
     local data = exec("timeout 3 /usr/sbin/tailscale status --json 2>/dev/null")
@@ -111,16 +141,23 @@ local function tailscale_status()
     return nil
 end
 
--- Helper: get guest subnet CIDR from br-guest interface
+-- Helper: get the guest network as NETWORK/PREFIX for br-guest's IPv4 address, or nil.
+-- The network comes from /bin/ipcalc.sh, the tool GL's own script relies on, never from zeroing the
+-- last octet: that is right only for a /24 (192.168.9.1/23 is network 192.168.8.0/23), and a
+-- wrong network misses GL's "from <net>" rule in fix_guest_policy_route and advertises a route that
+-- is not a network address. Both values end up in "sh -c" strings: the address capture admits only
+-- digits, dots and one slash, and the result must match the CIDR pattern below or nil is returned.
 local function get_guest_subnet()
-    local data = exec("ip -4 addr show br-guest 2>/dev/null")
-    if data then
-        local a, b, c, prefix = data:match("inet (%d+)%.(%d+)%.(%d+)%.%d+/(%d+)")
-        if a then
-            return a .. "." .. b .. "." .. c .. ".0/" .. prefix
-        end
-    end
-    return nil
+    local data = exec("ip -4 addr show br-guest 2>/dev/null") or ""
+    local addr = data:match("inet (%d+%.%d+%.%d+%.%d+/%d+)")
+    if not addr then return nil end
+    local calc = exec("/bin/ipcalc.sh " .. addr .. " 2>/dev/null") or ""
+    local network = calc:match("NETWORK=([^\n]*)")
+    local prefix = calc:match("PREFIX=([^\n]*)")
+    if not network or not prefix then return nil end
+    local cidr = network .. "/" .. prefix
+    if not cidr:match("^%d+%.%d+%.%d+%.%d+/%d+$") then return nil end
+    return cidr
 end
 
 -- Helper: get currently advertised routes from tailscale prefs
@@ -157,6 +194,19 @@ local function update_guest_route(enable)
 
     if enable and not found then
         new_routes[#new_routes + 1] = guest_subnet
+    end
+
+    -- Validate every route before it reaches the shell. exec() runs its argument
+    -- through "sh -c", and these values arrive from the daemon's prefs — a trust
+    -- boundary we do not own — so an entry carrying shell metacharacters would run
+    -- as root. Same charset gate already applied to the exit-node interpolation.
+    -- Abort rather than filter: silently dropping an entry would rewrite the user's
+    -- advertised routes, so if the input can't be trusted, leave them untouched.
+    for _, route in ipairs(new_routes) do
+        if not route:match("^[%x%.:/]+$") then
+            exec("logger -t ts-fix 'refusing to set advertised routes: daemon prefs contained an unexpected character'")
+            return
+        end
     end
 
     local routes_str = table.concat(new_routes, ",")
@@ -309,11 +359,16 @@ end
 -- When the guest subnet is advertised, Tailscale creates a source-based rule
 -- at priority 0: "from <guest_subnet> lookup main". This catches ALL traffic
 -- originating from guest clients and sends it to the main table → WAN,
--- completely bypassing the exit node (priority 5270) AND the kill switch
--- (priority 5279). Replace with a destination-based rule: "to <guest_subnet>
--- table main" (matching Tailscale's own treatment of the LAN subnet). This
--- preserves inbound tailnet→guest reachability while letting guest clients
--- use the exit node. Confirmed by GL engineer prototype (gl_tailscale-guest).
+-- completely bypassing the exit node (priority 5270). Replace with a
+-- destination-based rule: "to <guest_subnet> table main" (matching Tailscale's
+-- own treatment of the LAN subnet). This preserves inbound tailnet→guest
+-- reachability while letting guest clients use the exit node. Confirmed by GL
+-- engineer prototype (gl_tailscale-guest). The kill switch has a routing layer
+-- as well as its severed firewall forwardings (/usr/bin/ts-fix-ks): GL's
+-- "from <guest_subnet>" rule would route guest traffic around that layer's
+-- priority-5279 rules, so while armed the engine replaces it with this same
+-- "to <guest_subnet>" rule. The delete below therefore also takes the kill
+-- switch's copy, which the disabled path puts straight back via the engine.
 local function fix_guest_policy_route(enabled)
     local guest_subnet = get_guest_subnet()
     if not guest_subnet then return end
@@ -324,48 +379,12 @@ local function fix_guest_policy_route(enabled)
 
     if enabled then
         exec("ip rule add to " .. guest_subnet .. " table main priority 0")
-    end
-end
-
--- Helper: set kill switch routing rules (ip rule + ip route), both families.
--- Uses policy routing instead of firewall rules to block before conntrack.
--- Table 100 = unreachable default, priority 5279 = after Tailscale's 5270 and
--- ahead of GL 4.9's ts_killswitch blackhole at 5280 (off 5280 = no collision).
--- GL's is IPv4-only + br-lan-only, so it backstops nothing for IPv6/guest —
--- ours at 5279 is the only complete kill switch.
--- Applied to IPv4 and IPv6. "ip -6" errors are suppressed: if IPv6 is
--- compiled out the calls fail; if IPv6 is merely disabled the rules install
--- inert (no IPv6 traffic to act on). Neither case is harmful.
-local function set_killswitch_route(enabled)
-    for _, fam in ipairs({"-4", "-6"}) do
-        if enabled then
-            -- Ensure table 100 has unreachable default
-            local rt = exec("ip " .. fam .. " route show table 100 2>/dev/null") or ""
-            if not rt:match("unreachable default") then
-                exec("ip " .. fam .. " route add unreachable default table 100 2>/dev/null")
-            end
-            -- Add ip rules for br-lan and br-guest at priority 5279 (idempotent).
-            -- Exact match (interface AND "lookup 100") — a bare "iif br-lan" match
-            -- would also match GL 4.9's "iif br-lan blackhole" and skip our install.
-            local rules = exec("ip " .. fam .. " rule list priority 5279 2>/dev/null") or ""
-            if not rules:match("iif br%-lan lookup 100") then
-                exec("ip " .. fam .. " rule add iif br-lan priority 5279 lookup 100 2>/dev/null")
-            end
-            if not rules:match("iif br%-guest lookup 100") then
-                exec("ip " .. fam .. " rule add iif br-guest priority 5279 lookup 100 2>/dev/null")
-            end
-            -- Migration: with 5279 up, drop any legacy priority-5280 rule from a
-            -- pre-5279 install (only our exact lookup-100 rules; GL's 5280 stays).
-            exec("ip " .. fam .. " rule del iif br-lan priority 5280 lookup 100 2>/dev/null")
-            exec("ip " .. fam .. " rule del iif br-guest priority 5280 lookup 100 2>/dev/null")
-        else
-            -- Remove our ip rules (5279 current + 5280 legacy) and the route.
-            exec("ip " .. fam .. " rule del iif br-lan priority 5279 lookup 100 2>/dev/null")
-            exec("ip " .. fam .. " rule del iif br-guest priority 5279 lookup 100 2>/dev/null")
-            exec("ip " .. fam .. " rule del iif br-lan priority 5280 lookup 100 2>/dev/null")
-            exec("ip " .. fam .. " rule del iif br-guest priority 5280 lookup 100 2>/dev/null")
-            exec("ip " .. fam .. " route del unreachable default table 100 2>/dev/null")
-        end
+    else
+        -- Re-assert the kill switch's rule layer, swap included. rules-ensure takes no lock and
+        -- self-gates on the committed armed intent (set_config commits before it calls this) and
+        -- on Router mode, so on a disarmed router it is a no-op: the engine, not this module,
+        -- decides whether anything is armed.
+        exec("/usr/bin/ts-fix-ks rules-ensure </dev/null >/dev/null 2>&1")
     end
 end
 
@@ -402,7 +421,7 @@ local firmware_version, fw_is_49_plus = detect_firmware()
     @out bool   ts_running             Whether Tailscale is in Running state
     @out string ts_version             Installed Tailscale version
     @out string exit_node_ip           Currently configured remote exit node IP (from GL config)
-    @out bool   kill_switch_fw_active  Whether kill switch routing rules are currently active
+    @out bool   kill_switch_fw_active  Whether every forwarding the kill switch severed is still severed
     @out bool   route_guest_fw_active  Whether guest→tailscale forwardings are currently active
 --]]
 function M.get_config()
@@ -424,6 +443,8 @@ function M.get_config()
     res.kill_switch = c:get(TS_FIX_CONFIG, "settings", "kill_switch") == "1"
     res.route_guest = c:get(TS_FIX_CONFIG, "settings", "route_guest") == "1"
     res.tailscale_ssh = c:get(TS_FIX_CONFIG, "settings", "tailscale_ssh") == "1"
+    res.ks_follow_exit_node = c:get(TS_FIX_CONFIG, "settings", "ks_follow_exit_node") == "1"
+    res.hide_ts_domain = c:get(TS_FIX_CONFIG, "settings", "hide_ts_domain") == "1"
     res.ks_upgrade_hint_pending = c:get(TS_FIX_CONFIG, "settings", "ks_upgrade_hint_pending") == "1"
 
     -- GL's Tailscale UCI settings
@@ -460,13 +481,56 @@ function M.get_config()
     -- nginx restart).
     res.ts_version = get_ts_version()
 
-    -- Kill switch routing rule state — checked per family (IPv4 + IPv6).
-    -- Reported active only when BOTH families' rules are present; a torn
-    -- state (one family only, e.g. a partial reapply) reports false so the
-    -- UI prompts a re-apply rather than silently claiming full protection.
-    local ks_v4 = (exec("ip -4 rule list priority 5279 2>/dev/null") or ""):match("lookup 100") ~= nil
-    local ks_v6 = (exec("ip -6 rule list priority 5279 2>/dev/null") or ""):match("lookup 100") ~= nil
-    res.kill_switch_fw_active = ks_v4 and ks_v6
+    -- Kill switch state. The kill switch is firewall-zone state owned entirely by
+    -- /usr/bin/ts-fix-ks, so this only VERIFIES the engine's own record: every src:dest
+    -- pair listed in the ks_severed sidecar must still have a disabled forwarding behind
+    -- it and no enabled one. Pure uci reads — no classification (that lives in the engine
+    -- and nowhere else) and no shell-outs, because this runs on the UI's 10s poll.
+    -- Fail-secure in every ambiguous direction: an empty record, a recorded pair whose
+    -- sections have gone away, and a pair carrying an enabled section beside our disabled
+    -- one all report false. A torn state surfaces in the UI rather than claiming protection
+    -- it does not have; the engine's check pass — every watchdog poll — is what repairs it.
+    local severed = c:get(TS_FIX_CONFIG, "settings", "ks_severed")
+    local sev_pairs = {}
+    if type(severed) == "table" then
+        for _, p in ipairs(severed) do sev_pairs[#sev_pairs + 1] = p end
+    elseif type(severed) == "string" then
+        -- A one-element list can read back as a plain string on some uci bindings.
+        for p in severed:gmatch("%S+") do sev_pairs[#sev_pairs + 1] = p end
+    end
+    -- The engine touches /tmp/ts-fix-ks.commit-failed when a uci commit fails: the severing
+    -- then exists only as an uncommitted delta in /tmp/.uci — not persisted, not survivable
+    -- across a reboot, and not something to report as protection. It outranks the pair check
+    -- below and clears on the engine's first successful commit, which its check pass retries.
+    local ks_ok = #sev_pairs > 0 and not fs.access("/tmp/ts-fix-ks.commit-failed")
+    if ks_ok then
+        -- One pass over the forwardings, keyed by pair, recording BOTH halves. GL ships
+        -- anonymous and named forwarding sections and more than one can carry the same
+        -- src/dest, so a pair is severed only when at least one matching section is
+        -- explicitly disabled AND none is still enabled — uci's absent-enabled means
+        -- enabled, so a fresh duplicate re-emitted beside our disabled one reads as not
+        -- fully armed instead of masking a live egress path. src and dest are type-guarded:
+        -- a hand-edited list-typed value must not raise inside this poll, where the UI's
+        -- fetch swallows the error and the panel would silently stop updating.
+        local pair_off, pair_on = {}, {}
+        c:foreach(FW_CONFIG, "forwarding", function(s)
+            if type(s.src) == "string" and type(s.dest) == "string" then
+                local pair = s.src .. ":" .. s.dest
+                if s.enabled == "0" then
+                    pair_off[pair] = true
+                else
+                    pair_on[pair] = true
+                end
+            end
+        end)
+        for _, p in ipairs(sev_pairs) do
+            if pair_on[p] or not pair_off[p] then
+                ks_ok = false
+                break
+            end
+        end
+    end
+    res.kill_switch_fw_active = ks_ok
 
     -- Guest routing firewall forwarding state
     res.route_guest_fw_active = c:get(FW_CONFIG, "ts_fix_guest2ts") ~= nil
@@ -490,9 +554,15 @@ end
     @in  bool  ?kill_switch           Enable/disable kill switch
     @in  bool  ?route_guest           Enable/disable guest network routing via Tailscale
     @in  bool  ?tailscale_ssh         Enable/disable Tailscale SSH server
+    @in  bool  ?ks_follow_exit_node   Kill switch mirrors GL's Custom Exit Node setting (watchdog-enforced)
+    @in  bool  ?hide_ts_domain        Stop advertising the tailnet search domain to LAN clients
+
+    @out bool   ?ks_mode_refused      Kill switch enable was refused — the router is not in Router mode
+    @out string ?ks_mode_msg          Why it was refused, for display next to the toggle
 --]]
 function M.set_config(params)
     local c = uci.cursor()
+    local res = {}
 
     -- Check tailscale is enabled
     local ts_enabled = c:get(TS_CONFIG, "settings", "enabled") == "1"
@@ -511,15 +581,44 @@ function M.set_config(params)
         exit_node_changed = true
     end
 
-    -- Handle kill_switch
+    -- Handle kill_switch. Nothing is enforced here: /usr/bin/ts-fix-ks is the single owner of
+    -- all kill-switch state, so this records the user's intent and fires the engine further
+    -- down, AFTER the commit — the engine reads committed UCI, never our staged delta.
+    --
+    -- Enabling is refused when the router is not in Router mode: bridged/extender modes do not
+    -- carry LAN traffic through the forward path, so severing forwardings would enforce nothing
+    -- while the UI claimed protection. The engine refuses the same case itself (rc 2); this
+    -- pre-check exists because a detached spawn's exit status is unreadable from here, and it is
+    -- what lets the UI say why. An unset or unreadable mode is NOT a refusal — refusing on an
+    -- unknown mode would fail open on any firmware that stops shipping the value.
+    --
+    -- Disabling is never refused. A user must always be able to take protection down, whatever
+    -- mode the router reports — being stranded behind a kill switch is the failure this project
+    -- exists to avoid.
+    local ks_action = nil
     if params.kill_switch ~= nil then
-        local val = params.kill_switch and "1" or "0"
-        c:set(TS_FIX_CONFIG, "settings", "kill_switch", val)
-        set_killswitch_route(params.kill_switch)
-        -- User interacted with the KS toggle — clear the v1.0.18→v1.0.19
-        -- migration hint whether they enabled or disabled it. The hint's
-        -- job was to draw attention to the toggle, and they've seen it.
-        c:set(TS_FIX_CONFIG, "settings", "ks_upgrade_hint_pending", "0")
+        -- glconfig is none of our packages and may be absent entirely (non-GL firmware, a
+        -- future rename): read it defensively and normalise every unknown shape — missing,
+        -- read error, non-string — to "", which is the arm-and-let-the-engine-warn case.
+        local ok_mode, mode = pcall(function()
+            return c:get("glconfig", "general", "mode")
+        end)
+        if not ok_mode or type(mode) ~= "string" then mode = "" end
+        if params.kill_switch and mode ~= "" and mode ~= "router" then
+            res.ks_mode_refused = true
+            res.ks_mode_msg = "The Kill Switch requires Router mode (this router is in "
+                .. mode .. " mode), so it was not enabled. Any other settings you changed "
+                .. "were applied."
+            ngx.log(ngx.WARN, "ts-fix: refusing to enable kill switch — glconfig.general.mode='"
+                .. mode .. "' bypasses the forward path")
+        else
+            c:set(TS_FIX_CONFIG, "settings", "kill_switch", params.kill_switch and "1" or "0")
+            ks_action = params.kill_switch and "arm" or "disarm"
+            -- User interacted with the KS toggle — clear the v1.0.18→v1.0.19
+            -- migration hint whether they enabled or disabled it. The hint's
+            -- job was to draw attention to the toggle, and they've seen it.
+            c:set(TS_FIX_CONFIG, "settings", "ks_upgrade_hint_pending", "0")
+        end
     end
 
     -- Handle route_guest
@@ -535,6 +634,32 @@ function M.set_config(params)
         local val = params.tailscale_ssh and "1" or "0"
         c:set(TS_FIX_CONFIG, "settings", "tailscale_ssh", val)
         ssh_changed = true
+    end
+
+    -- Handle ks_follow_exit_node — a persistent preference, not live state.
+    -- The watchdog enforces it (arms/disarms the kill switch tracking GL's
+    -- exit_node_ip UCI within one 5s poll). Deliberately NOT reset by the
+    -- Tailscale-disable teardown: it describes how the KS should behave
+    -- whenever Tailscale is on, so it survives disable/enable cycles (the
+    -- side-switch accessory relies on exactly that).
+    if params.ks_follow_exit_node ~= nil then
+        c:set(TS_FIX_CONFIG, "settings", "ks_follow_exit_node",
+              params.ks_follow_exit_node and "1" or "0")
+    end
+
+    -- Handle hide_ts_domain — a persistent preference. The dnsmasq write itself is done by
+    -- ts-fix-reapply (which owns the strip logic) and enforced by the watchdog; duplicating
+    -- that logic here in a second language would buy nothing. Turning it OFF clears our
+    -- ownership record so a later re-enable re-derives from the user's current value rather
+    -- than restoring a stale one; GL puts its suffix back on its next trigger. No spawn is
+    -- added here deliberately — the watchdog picks the new preference up within one 5s poll,
+    -- exactly as ks_follow_exit_node works.
+    if params.hide_ts_domain ~= nil then
+        c:set(TS_FIX_CONFIG, "settings", "hide_ts_domain",
+              params.hide_ts_domain and "1" or "0")
+        if not params.hide_ts_domain then
+            c:delete(TS_FIX_CONFIG, "settings", "user_domain")
+        end
     end
 
     if not c:commit(TS_FIX_CONFIG) then
@@ -574,8 +699,8 @@ function M.set_config(params)
     if route_changed then
         local rg = c:get(TS_FIX_CONFIG, "settings", "route_guest") == "1"
         update_guest_route(rg)
-        -- Fix policy route: swap Tailscale's "from <guest>" (blocks exit node
-        -- + kill switch) with "to <guest>" (allows both). Must run after
+        -- Fix policy route: swap Tailscale's "from <guest>" (blocks the exit
+        -- node) with "to <guest>" (allows it). Must run after
         -- update_guest_route which triggers Tailscale to create its rules.
         fix_guest_policy_route(rg)
     end
@@ -584,7 +709,69 @@ function M.set_config(params)
     -- IPv6 through the exit node). masq6 on all firmware, IPv4 masq pre-4.9.
     ensure_masquerade(fw_is_49_plus)
 
-    return {}
+    -- Fire the kill-switch engine. It self-gates on COMMITTED intent (kill_switch=1 AND
+    -- Tailscale enabled), so this MUST come after the ts-fix commit above or an arm would be a
+    -- logged no-op. It also lands after the masquerade and guest-routing writes so our own uci
+    -- commits on the firewall package never overlap the engine's.
+    --
+    -- Detached, with stdin redirected as well as stdout/stderr: arm severs forwardings, commits
+    -- both packages and reloads the firewall, which is far too slow to hold an RPC response
+    -- open, and sh exits immediately so the child is reparented away from this nginx worker.
+    -- Its exit status is therefore unreadable here by construction — the mode pre-check above
+    -- covers the one refusal a user needs told about, and the watchdog's 5s check pass is the
+    -- retry for an engine failure. ks_action is our own literal, never user input.
+    if ks_action then
+        ngx.pipe.spawn({"sh", "-c",
+            "/usr/bin/ts-fix-ks " .. ks_action .. " </dev/null >/dev/null 2>&1 &"})
+    end
+
+    -- Exit-node reconcile fast path (v1.0.22): GL's exit_node_ip UCI is the
+    -- authoritative exit-node intent; push it to the daemon when the two
+    -- disagree. On buggy tiny Tailscale builds (ts_omit_ipnbus, before the
+    -- upstream fix 2026-06-04) GL's "tailscale up --reset" can fail to
+    -- dispatch exit-node changes — most visibly the CLEAR direction, leaving
+    -- the daemon routing through an exit node the user disabled. This is the
+    -- fastest recovery when the page is open (the JS post-Apply reapply calls
+    -- set_config after GL's restart settles); ts-fix-reapply and the watchdog
+    -- cover headless paths. All firmware — the bug is binary-side, not 4.9
+    -- (reproduced live on 4.8.5, E5800 control matrix 2026-06-03).
+    --
+    -- SET is snapshot-gated (last_seen_exit_node_ip, owned by ts-fix-reapply)
+    -- so a stale pre-4.9 UCI value left behind by an old GL disable can't
+    -- resurrect a long-dead exit node; CLEAR is ungated — a daemon routing
+    -- with no configured exit node is reconciled whenever seen. Detached
+    -- spawn: "tailscale set" can block on the buggy binaries, and it must
+    -- never stall this RPC response (sh exits immediately; the backgrounded
+    -- call is reparented away from the worker).
+    local gl_exit_ip = c:get(TS_CONFIG, "settings", "exit_node_ip") or ""
+    -- No -x (see tailscale_status): BusyBox pgrep -x never matches the
+    -- path-invoked daemon, which would silently skip this reconcile forever.
+    if exec_rc("pgrep tailscaled >/dev/null 2>&1") == 0 then
+        local prefs_raw = exec("timeout 3 /usr/sbin/tailscale debug prefs 2>/dev/null")
+        local okp, prefs = pcall(cjson.decode, prefs_raw or "")
+        local eid = ""
+        if okp and type(prefs) == "table" and type(prefs.ExitNodeID) == "string" then
+            eid = prefs.ExitNodeID
+        end
+        local last_seen = c:get(TS_FIX_CONFIG, "settings", "last_seen_exit_node_ip") or ""
+        if gl_exit_ip == "" and eid ~= "" then
+            ngx.log(ngx.WARN, "ts-fix: exit node cleared in UCI but daemon ExitNodeID stuck — reconciling")
+            ngx.pipe.spawn({"sh", "-c",
+                "timeout 10 /usr/sbin/tailscale set --exit-node= >/dev/null 2>&1 &"})
+        elseif gl_exit_ip ~= "" and eid == "" and gl_exit_ip ~= last_seen
+               and gl_exit_ip:match("^[%w%.%:%-]+$") then
+            -- Charset guard keeps the UCI value shell-safe (IP/hostname
+            -- characters only) before interpolation into the sh -c string.
+            ngx.log(ngx.WARN, "ts-fix: exit node set in UCI but daemon ExitNodeID empty — reconciling")
+            ngx.pipe.spawn({"sh", "-c",
+                "timeout 10 /usr/sbin/tailscale set --exit-node='" .. gl_exit_ip .. "' >/dev/null 2>&1 &"})
+        end
+    end
+
+    -- Empty on the normal path; carries ks_mode_refused + ks_mode_msg when the kill-switch
+    -- enable was refused above. Deliberately NOT an err_code: every other setting in the same
+    -- Apply was written, so the UI reverts the one toggle rather than all of them.
+    return res
 end
 
 --[[
@@ -592,29 +779,39 @@ end
     @method-name: get_update_info
     @method-desc: Get installed and latest Tailscale version info
 
-    @out string installed_version   Currently installed version
-    @out string latest_version      Latest stable version available
-    @out bool   update_available    Whether an update is available
+    @out string installed_version   Currently installed version (base X.Y.Z, for display)
+    @out string installed_full      Installed version incl. build suffix (comparison)
+    @out string latest_version      Latest version available (base X.Y.Z, for display)
+    @out string latest_full         Latest version incl. build suffix (comparison)
+    @out bool   update_available    Whether an update is available (full-string compare)
+    @out bool   is_rebuild          Update is an in-place rebuild (same base, new build suffix)
     @out string arch                Detected architecture
 --]]
 function M.get_update_info()
     local res = {}
 
-    -- Installed version (cached per-worker with mtime invalidation)
+    -- Installed version (cached per-worker with mtime invalidation).
+    -- Base for display, full string for comparison.
     res.installed_version = get_ts_version()
+    res.installed_full = get_ts_version_full()
 
     -- Architecture (hardcoded after first call — doesn't change at runtime)
     local arch = exec("uname -m 2>/dev/null")
     res.arch = arch and arch:match("^(%S+)") or "unknown"
 
-    -- Check for cached latest version (updated by ts-fix-update --check)
+    -- Check for cached latest version (updated by ts-fix-update --check; a
+    -- full string like "1.98.8-tiny.by.admon.1320" since v1.0.22 — legacy
+    -- caches from older versions hold the base only, handled below)
     local cache_file = "/tmp/ts-fix-latest-version"
     if fs.access(cache_file) then
         local f = io.open(cache_file, "r")
         if f then
-            res.latest_version = f:read("*l") or "unknown"
+            res.latest_full = f:read("*l") or "unknown"
             f:close()
+        else
+            res.latest_full = "unknown"
         end
+        res.latest_version = base_ver(res.latest_full) or res.latest_full
         -- Background refresh if cache is stale (returns cached value, no UI flash)
         if is_cache_stale(cache_file) then
             ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--check"})
@@ -623,13 +820,28 @@ function M.get_update_info()
         -- No cache — trigger async version check
         ngx.pipe.spawn({"/usr/bin/ts-fix-update", "--check"})
         res.latest_version = "checking..."
+        res.latest_full = "checking..."
     end
 
-    if res.installed_version ~= "unknown" and res.latest_version ~= "unknown"
-       and res.latest_version ~= "checking..." then
-        res.update_available = res.installed_version ~= res.latest_version
-    else
-        res.update_available = false
+    -- Update decision. Different base version → update (unchanged semantics).
+    -- Same base version → update only when the remote declares a build suffix
+    -- that differs from the installed one: upstream replaces release assets in
+    -- place under the same base (the 2026-06-04 ipnbus fix shipped that way),
+    -- and a base-only compare left routers stuck on the buggy build reporting
+    -- "Already at latest". Requiring a remote suffix also keeps a legacy
+    -- base-only cache (pre-v1.0.22) from offering a phantom rebuild.
+    res.update_available = false
+    res.is_rebuild = false
+    if res.installed_full ~= "unknown" and res.latest_full ~= "unknown"
+       and res.latest_full ~= "checking..." then
+        local same_base = base_ver(res.installed_full) == base_ver(res.latest_full)
+        if not same_base then
+            res.update_available = true
+        elseif res.latest_full:find("-", 1, true)
+               and res.installed_full ~= res.latest_full then
+            res.update_available = true
+            res.is_rebuild = true
+        end
     end
 
     return res

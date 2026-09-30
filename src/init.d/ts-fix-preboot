@@ -1,0 +1,53 @@
+#!/bin/sh /etc/rc.common
+# gl-tailscale-fix: pre-firewall kill-switch pass (one-shot, at boot).
+#
+# Why START=18. procd runs the boot scripts one at a time, in name order. /etc/init.d/boot (S10)
+# runs /etc/uci-defaults — GL's ROM first-boot defaults, on the first boot of a new firmware
+# overlay — then S19firewall applies UCI and S20network brings the uplinks up. 18 puts this pass
+# after S10 and before every S19, the firewall included. GL ships its own S18 scripts
+# (dnscrypt-proxy, dnsproxy, gl_dpi_dnsmasq_prepare); name order puts S18ts-fix-preboot after them.
+#
+# What it protects: the first boot after a firmware upgrade that keeps settings. On that boot GL's
+# /rom/etc/uci-defaults/99-vpn-client sets every lan -> wan and guest -> wan forwarding back to
+# enabled — the ones an armed kill switch had severed among them — at S10, before anything of ours
+# runs. This pass re-severs them before the firewall starts, so S19 comes up severed. On an ordinary
+# boot there is normally nothing for it to change.
+#
+# It changes UCI only. The engine's preboot subcommand re-applies the zone severing and commits,
+# with no firewall reload (S19 applies the committed config), no netlink work and no waiting, and
+# it self-gates on armed intent and Router mode, so a disarmed router is a no-op.
+#
+# The pass lives in boot(), which is what procd runs at boot (rcS S boot), and start() is a
+# deliberate no-op. rc.common's restart and reload both call start(), so a restart or reload of
+# this script (from LuCI's Startup page, say) would otherwise run the pass on a live router, where
+# committing the severing without a firewall reload leaves UCI severed and netfilter open — and
+# the watchdog's check then finds nothing left to change, so nothing reloads.
+# boot() passes TS_FIX_KS_BOOT=1, and the engine refuses preboot without it (rc 2, before any lock,
+# uci or ip call). `/etc/init.d/ts-fix-preboot boot` is therefore the boot entry point, not a
+# maintenance command: run by hand on a live router it passes the variable too, and hits the hazard
+# above.
+#
+# No STOP, so `enable` creates only the S18 link, and there is nothing to stop. It must never fail
+# the boot: boot() returns 0 whatever the pass reports, and a missing engine (a half-restored
+# sysupgrade) is logged rather than fatal.
+# Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
+# https://github.com/RemoteToHome-io/gl-tailscale-fix
+
+START=18
+
+boot() {
+    # if/else for the same reason as the ts-fix init script: a failed pass and a missing engine
+    # need different log lines, and a missing binary must not splat "not found" into the boot log.
+    if [ -x /usr/bin/ts-fix-ks ]; then
+        TS_FIX_KS_BOOT=1 /usr/bin/ts-fix-ks preboot </dev/null || \
+            logger -t ts-fix "preboot: ts-fix-ks preboot returned rc $? - the zone severing may not have been re-applied before the firewall start"
+    else
+        logger -t ts-fix "preboot: /usr/bin/ts-fix-ks missing or not executable - pre-firewall kill-switch pass NOT run (half-restored sysupgrade?)"
+    fi
+    return 0
+}
+
+# No-op on purpose: restart and reload call start(), and the pass must never run on a live router.
+start() {
+    return 0
+}

@@ -3,14 +3,29 @@
 # Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
 # https://github.com/RemoteToHome-io/gl-tailscale-fix
 
-# Restore user config saved by prerm (handles --force-reinstall which
-# runs full teardown because opkg doesn't set PKG_UPGRADE=1).
-# Precedence: saved config > existing config > default template.
-if [ -f /tmp/ts-fix-config.saved ]; then
+# ---8<--- config restore
+# Config restore. Precedence: the live file > the copy prerm saved > the default template.
+# Unit-tested by tests/unit/test-postinst-config.sh, which extracts this block by its markers.
+#
+# The live file wins because on an upgrade it is the newest state. prerm copies it to /tmp before
+# its PKG_UPGRADE exit, so on every upgrade too, and between prerm and this script an interface
+# event can start a reapply whose arm commits the kill switch's record of every forwarding it
+# severed (ts-fix.settings.ks_severed). Moving the older copy over the live file would drop that
+# record while the forwardings stay severed in /etc/config/firewall, and nothing re-enables a
+# severed forwarding that has no record: the LAN would stay dark after the kill switch is turned
+# off or the package is removed.
+#
+# The saved copy is for removal and --force-reinstall (opkg does not set PKG_UPGRADE=1 for the
+# latter), where prerm's teardown ran and a successful disarm deleted the live file: it then holds
+# the user's settings. A failed disarm keeps the live file, record included, so it wins here too.
+if [ -f /etc/config/ts-fix ]; then
+    rm -f /tmp/ts-fix-config.saved
+elif [ -f /tmp/ts-fix-config.saved ]; then
     mv /tmp/ts-fix-config.saved /etc/config/ts-fix
-elif [ ! -f /etc/config/ts-fix ]; then
+else
     cp /etc/config/ts-fix.default /etc/config/ts-fix
 fi
+# ---8<--- end config restore
 
 # Restore original GL wrapper if it was modified (e.g., users who manually
 # added --advertise-exit-node before the plugin existed). The plugin handles
@@ -34,9 +49,11 @@ if [ -f /etc/sysupgrade.conf ]; then
     sed -i '\|^/usr/sbin/tailscaled$|d' /etc/sysupgrade.conf 2>/dev/null
 fi
 
-# Firmware detection — on GL 4.9+ we keep the plugin fully active (Kill
-# Switch, Guest routing, SSH, Version Manager, masquerade) but hide UI
-# for features GL now provides natively (Advertise Exit Node).
+# Firmware detection — needed by the reconcile-snapshot handling immediately
+# below as well as the migration hint further down. On GL 4.9+ we keep the
+# plugin fully active (Kill Switch, Guest routing, SSH, Version Manager,
+# masquerade) but hide UI for features GL now provides natively (Advertise
+# Exit Node).
 fw_ver=$(awk '{print $1}' /etc/glversion 2>/dev/null)
 is_fw49_plus=0
 if [ -n "$fw_ver" ]; then
@@ -47,6 +64,50 @@ if [ -n "$fw_ver" ]; then
         is_fw49_plus=1
     fi
 fi
+
+# Exit-node reconcile snapshot: SEED pre-4.9, CLEAR on 4.9+.
+#
+# The reconcile (ts-fix-reapply / RPC) acts only when GL's exit_node_ip differs
+# from this snapshot.
+#
+# Pre-4.9 we SEED it to the current value, making install/upgrade inert. That
+# matters there because a long-disabled Custom Exit Node can leave a stale
+# exit_node_ip behind in GL's UCI, and the first reapply would push it to the
+# daemon — silently resurrecting an exit node the user had turned off.
+#
+# On 4.9+ that stale-value case cannot arise: GL's own RPC set_config
+# UNCONDITIONALLY rewrites exit_node_ip on every apply — the supplied value, or
+# "" when the parameter is absent, and "" again in run_exit_node mode (verified
+# in /usr/lib/oui-httpd/rpc/tailscale, MT3000 4.9.0, 2026-08-13). A non-empty
+# value there means the user's most recent apply supplied one.
+#
+# So on 4.9+ we CLEAR the snapshot instead, which forces exactly one reconcile
+# pass on the next reapply. Without that, this release does not fix the very
+# population it is for (issue #14): a router whose GL UCI already carries an
+# exit node while the daemon's ExitNodeID never took would upgrade, find the
+# preserved snapshot already equal to the current value — v1.0.20+ maintains
+# that field, so upgraders arrive with it populated — register no change, and
+# stay broken until the user manually toggled the setting.
+#
+# Clearing is safe on a healthy router: the reconcile's inner branches each
+# require an actual UCI/daemon mismatch, so a correct router simply re-records
+# the snapshot and takes no action.
+if [ "$is_fw49_plus" = "1" ]; then
+    uci -q delete ts-fix.settings.last_seen_exit_node_ip 2>/dev/null
+    uci commit ts-fix 2>/dev/null
+else
+    _cur_exit_ip=$(uci -q get tailscale.settings.exit_node_ip)
+    uci set ts-fix.settings.last_seen_exit_node_ip="$_cur_exit_ip" 2>/dev/null && \
+        uci commit ts-fix 2>/dev/null
+fi
+
+# Drop any cached latest-version file from a previous plugin version. The
+# cache format changed in v1.0.22 (full version string incl. build suffix,
+# was base-only); a stale base-only cache would delay rebuild detection
+# until the next TTL refresh. /tmp cache — cheap to rebuild on next check.
+rm -f /tmp/ts-fix-latest-version
+
+# (Firmware detection moved above — the reconcile-snapshot handling needs it.)
 
 # Migration from v1.0.18 (which wiped KS functionality on 4.9+): set a
 # one-shot hint so the UI prompts the user to re-enable the Kill Switch.
@@ -77,16 +138,120 @@ if [ "$is_fw49_plus" = "1" ]; then
     fi
 fi
 
-# Enable and start procd service (runs watchdog on every firmware version)
+# Enable and (re)start the procd service (runs watchdog on every firmware
+# version). Under the zone kill switch there is nothing left to install ahead
+# of netifd — enforcement is flash-persisted firewall UCI that comes up with
+# the firewall's own boot — so START is back at the stock 99. The v1.0.22 dev
+# builds ran the init script at START=19 for the RPDB-era boot guard, so remove
+# a stale S19 symlink first: enable only creates the S99 link, it does not
+# clean up differently-numbered leftovers, and a surviving S19 would run the
+# init script twice per boot. MUST be restart, not start: on an upgrade prerm
+# skips the stop (PKG_UPGRADE=1) and procd's start is a no-op while the
+# instance is running, so the already-running shell would keep executing the
+# OLD watchdog loop until reboot — the new code on disk would never take
+# effect. restart works on a stopped service too (fresh install).
 if [ -x /etc/init.d/ts-fix ]; then
+    rm -f /etc/rc.d/S19ts-fix 2>/dev/null
+    # Kill the dev-era boot guard the same way, and for the same reason the S19 link is removed:
+    # those v1.0.22-S19 builds spawned a DETACHED `ip monitor rule` watcher that re-asserts the
+    # 5279/table-100 rules within milliseconds of a deletion, for up to 180s after an armed start.
+    # prerm exits early on an upgrade (PKG_UPGRADE=1), so nothing else stops it. Those rules are
+    # the current rule layer, which the arm below keeps, but the guard is not the engine: on a
+    # router this script leaves disarmed it would re-add them after the rules-clean below, and the
+    # rule layer would keep coming back with the kill switch off until its window ran out. Harmless
+    # when absent: no dev build, no match. The pattern brackets one letter per the cross-instrument
+    # convention (prerm uses the identical line on the removal path), so no other tool's pgrep of
+    # the same name can match it.
+    kill $(pgrep -f 'ip monitor rul[e]' 2>/dev/null) 2>/dev/null
     /etc/init.d/ts-fix enable 2>/dev/null
-    /etc/init.d/ts-fix start 2>/dev/null
+    /etc/init.d/ts-fix restart 2>/dev/null
+fi
+
+# Enable the pre-firewall kill-switch pass on every install and upgrade. enable only (re)creates
+# the S18 link (ln -sf, so it is idempotent), and the script declares no STOP, so no K link. It
+# is not started here: the pass exists for the first boot after a firmware upgrade, and the arm or
+# rules-clean below converges the running router.
+if [ -x /etc/init.d/ts-fix-preboot ]; then
+    /etc/init.d/ts-fix-preboot enable 2>/dev/null
+fi
+
+# Kill-switch convergence on the two-layer model. All enforcement logic lives in
+# /usr/bin/ts-fix-ks; this only converges the installed router on the intent
+# that the config restore above put in place (committed state — the engine
+# reads UCI, so it must be settled before either call).
+#
+# Armed router upgrading from an earlier build: arm severs the lan/guest egress
+# forwardings and commits them, then ensures the rule layer — the priority-5279
+# rules and the table-100 unreachable route, which are the CURRENT rule layer
+# and are kept, not dropped (a v1.0.21 or RPDB-era v1.0.22 router arrives with
+# them in place) — and only then drops the pre-v1.0.21 priority-5280 rules. One
+# call, and nothing is removed before its replacement is in place, so there is
+# no instant in which neither mechanism is enforcing.
+#
+# The two non-zero returns mean different things. rc 1 is an arm FAILURE (zone
+# state unreadable, unwritable, or uncommitted): the engine still ensures the
+# rule layer, so the router keeps blocking on it while the watchdog's 5s check
+# pass retries the zone side. rc 2 is a mode REFUSAL (a non-router glconfig
+# mode, where forward-path enforcement would be only partial): nothing is armed
+# by design, so the engine removes the rule layer on that path rather than
+# leave a blocking rule standing on a router it is not maintaining. Either way
+# the engine logs the detail itself; the rc is captured here only for context
+# in the syslog line.
+#
+# Disarmed router: rules-clean, which removes the rule layer — the 5279 rules,
+# the table-100 route and any pre-v1.0.21 priority-5280 rules — and is
+# idempotent.
+#
+# Ordered before the ts-fix-reapply spawn at the end of this script: reapply
+# calls the same engine, but the engine serializes on its own lock and every
+# operation is idempotent, so whichever pass lands second is a cheap no-op.
+#
+# The whole block is gated on the engine being present and executable. opkg has
+# installed it by the time postinst runs, so a miss means a broken install (a
+# truncated write, a half-restored sysupgrade) — and calling it anyway would
+# splat "not found" into opkg's output on either branch, the noise class of the
+# closed issue #5, while telling the user nothing. One loud syslog line instead.
+if [ -x /usr/bin/ts-fix-ks ]; then
+    if [ "$(uci -q get ts-fix.settings.kill_switch)" = "1" ] && \
+       [ "$(uci -q get tailscale.settings.enabled)" = "1" ]; then
+        /usr/bin/ts-fix-ks arm || logger -t ts-fix "postinst: ts-fix-ks arm rc $? - engine will retry via watchdog"
+    else
+        /usr/bin/ts-fix-ks rules-clean || logger -t ts-fix "postinst: ts-fix-ks rules-clean rc $? - kill-switch rule-layer rules may remain; watchdog check will retry"
+    fi
+else
+    logger -t ts-fix "postinst: /usr/bin/ts-fix-ks missing - zone kill switch NOT migrated (broken install?)"
+fi
+
+# Sanity-check installed UI artifacts against the package version. A silent
+# file-write failure (flash full, interrupted install) leaves the OLD js/body
+# filter serving under the NEW package version — the UI looks healthy but runs
+# stale code (field report: "Marv", stale JS after an upgrade). Loud logger so
+# opkg output surfaces it; not fatal — the plugin still runs, just flags it.
+PKG_VER=$(grep '^Version:' /usr/lib/opkg/info/gl-tailscale-fix.control 2>/dev/null | awk '{print $2}')
+if [ -n "$PKG_VER" ]; then
+    if ! grep -q "ts-fix.js?v=${PKG_VER}" /usr/share/ts-fix/ts-fix-body-filter.lua 2>/dev/null; then
+        logger -t ts-fix -s "ERROR: installed body filter does not carry package version ${PKG_VER} — file write may have failed, UI may serve stale code"
+    fi
+    if ! zcat /usr/share/ts-fix/www/ts-fix.js.gz 2>/dev/null | grep -q "'${PKG_VER}'"; then
+        logger -t ts-fix -s "ERROR: installed ts-fix.js.gz does not carry package version ${PKG_VER} — file write may have failed, UI may serve stale code"
+    fi
 fi
 
 # Restart nginx to pick up new/updated RPC module and injection config
-# (reload does NOT reliably clear module cache on GL routers)
+# (reload does NOT reliably clear module cache on GL routers). Ordered
+# stop → wait → escalate → start: the old bare "kill -9 + start" could race
+# a not-yet-released listen socket and leave nginx down (admin UI dead).
 if [ -x /etc/init.d/nginx ]; then
-    kill -9 $(pgrep nginx) 2>/dev/null
+    /etc/init.d/nginx stop 2>/dev/null
+    _i=0
+    while [ $_i -lt 10 ] && pgrep nginx >/dev/null 2>&1; do
+        sleep 1
+        _i=$((_i + 1))
+    done
+    if pgrep nginx >/dev/null 2>&1; then
+        kill -9 $(pgrep nginx) 2>/dev/null
+        sleep 1
+    fi
     /etc/init.d/nginx start 2>/dev/null
 fi
 

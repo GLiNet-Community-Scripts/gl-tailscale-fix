@@ -1,10 +1,29 @@
 #!/bin/sh /etc/rc.common
-# gl-tailscale-fix: procd service with watchdog for teardown detection
-# The watchdog polls tailscale.settings.enabled every 5 seconds. When it
-# transitions from enabled to disabled, it runs ts-fix-reapply (teardown).
-# procd_add_reload_trigger does NOT work on GL firmware (uci commit does not
-# emit config.change events), and iface hotplug events do not fire reliably
-# when Tailscale is disabled — the watchdog is the reliable teardown path.
+# gl-tailscale-fix: boot consistency check + procd watchdog service.
+#
+# Boot protection does not depend on this script's START, which is the stock 99. It comes from:
+#   - the firewall, which applies the persisted zone severing at S19 during its own boot — the
+#     severed lan/guest/iot -> uplink-class forwardings plus the lan -> tailscale0 tunnel path live
+#     in /etc/config/firewall — ahead of netifd (S20) and therefore before any WAN route exists;
+#   - /etc/init.d/ts-fix-preboot (S18), which re-severs on the first boot after a firmware
+#     upgrade, when GL's first-boot defaults have re-enabled those forwardings at S10;
+#   - the rule layer (the priority-5279 rules and the table-100 route), which netifd's start
+#     wipes along with every other policy rule, installed at the first non-loopback ifup by the
+#     10-ts-fix-ks hotplug handler and by this script's boot check pass.
+# So there is still no early START and no flush-reactive netlink guard (the v1.0.22 dev builds'
+# START=19 guard and its readiness handshake): the rules are not kept alive across netifd's
+# flush but re-installed after it, and the zone layer covers the interval until they are.
+#
+# What remains here is one ts-fix-ks consistency pass plus the watchdog. The pass self-gates: it
+# is quiet and write-free unless intent is armed (it then keeps both layers in place), severed
+# forwardings are recorded while intent is off (a lost disarm, which it unwinds), or
+# rule-layer rules stand while intent is off (which it removes). It logs its own failures; the
+# branch below only records that the boot pass came back non-zero.
+#
+# The watchdog polls tailscale.settings.enabled every 5 seconds. When it transitions from
+# enabled to disabled, it runs ts-fix-reapply (teardown). procd_add_reload_trigger does NOT
+# work on GL firmware (uci commit does not emit config.change events), and iface hotplug events
+# do not fire reliably when Tailscale is disabled — the watchdog is the reliable teardown path.
 # Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
 # https://github.com/RemoteToHome-io/gl-tailscale-fix
 
@@ -12,6 +31,14 @@ START=99
 USE_PROCD=1
 
 start_service() {
+    # if/else rather than `[ -x ] && check || logger`: that chain runs its logger arm for BOTH a
+    # failed check and a missing binary, and the two need different lines. A missing engine on a
+    # half-restored sysupgrade would otherwise also splat "not found" into the boot log.
+    if [ -x /usr/bin/ts-fix-ks ]; then
+        /usr/bin/ts-fix-ks check || logger -t ts-fix "boot check: ts-fix-ks reported failure (rc $?)"
+    else
+        logger -t ts-fix "boot check: /usr/bin/ts-fix-ks missing or not executable - kill-switch state NOT verified at boot (half-restored sysupgrade?)"
+    fi
     procd_open_instance
     procd_set_param command /usr/bin/ts-fix-watchdog
     procd_set_param respawn 3600 5 5
