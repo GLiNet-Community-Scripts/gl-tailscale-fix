@@ -49,6 +49,11 @@ if [ -f /etc/sysupgrade.conf ]; then
     sed -i '\|^/usr/sbin/tailscaled$|d' /etc/sysupgrade.conf 2>/dev/null
 fi
 
+# Migration for installs from builds whose static keep list pinned the Tailscale binaries across
+# firmware upgrades: keeps a Version Manager binary across upgrades as before (it is now listed in
+# /lib/upgrade/keep.d/gl-tailscale-fix-tailscale), and stops pinning a firmware binary.
+/usr/bin/ts-fix-update --sync-keep >/dev/null 2>&1 || true
+
 # Firmware detection — needed by the reconcile-snapshot handling immediately
 # below as well as the migration hint further down. On GL 4.9+ we keep the
 # plugin fully active (Kill Switch, Guest routing, SSH, Version Manager,
@@ -175,6 +180,66 @@ if [ -x /etc/init.d/ts-fix-preboot ]; then
     /etc/init.d/ts-fix-preboot enable 2>/dev/null
 fi
 
+# ---8<--- ts_state
+# The kill switch's intent, read as the engine reads it (_ks_intent in /usr/bin/ts-fix-ks). This
+# block is byte-identical in ts-fix-watchdog, ts-fix-reapply, hotplug 20-ts-fix and postinst;
+# tests/unit/test-ts-state.sh holds the copies to that, and to the engine's meaning.
+#
+# `uci -q get` prints nothing and returns 1 both for an absent option and for a read that failed,
+# so it cannot tell "off" from "unknown", and a failed read taken for "off" tears protection down.
+# `uci -q show <pkg>.settings` can: a readable section prints its own "<pkg>.settings=<type>" line
+# first, and a failed read prints nothing. An option absent from a readable section is off (GL's
+# slider accessory deletes tailscale.settings.enabled to restore its never-set state); a failed read
+# is UNKNOWN, and no caller may act on it as off. Shell matching only: no fork beyond the uci call.
+#
+# ts_state — tailscale.settings, read once: ts_en is 1 when it holds enabled='1', 0 for any other
+# value or none, and EMPTY when the read failed (rc 1); ts_eip is exit_node_ip's value, empty when
+# absent, and means something only when ts_en is not empty. uci prints the value single-quoted, and
+# an address holds no quote of its own, so the outer pair is all there is to strip.
+ts_state() {
+    local out nl='
+'
+    ts_en=""
+    ts_eip=""
+    out=$(uci -q show tailscale.settings 2>/dev/null)
+    case "$out" in
+        "tailscale.settings="*) ;;
+        *) return 1 ;;
+    esac
+    ts_en=0
+    case "$out$nl" in
+        *"${nl}tailscale.settings.enabled='1'$nl"*) ts_en=1 ;;
+    esac
+    case "$out" in
+        *"${nl}tailscale.settings.exit_node_ip="*)
+            ts_eip=${out#*"${nl}tailscale.settings.exit_node_ip="}
+            ts_eip=${ts_eip%%"$nl"*}
+            ts_eip=${ts_eip#\'}
+            ts_eip=${ts_eip%\'}
+            ;;
+    esac
+    return 0
+}
+
+# ks_state — ts-fix.settings, read once: ks_on is 1 when it holds kill_switch='1', 0 for any other
+# value or none, and EMPTY when the read failed (rc 1).
+ks_state() {
+    local out nl='
+'
+    ks_on=""
+    out=$(uci -q show ts-fix.settings 2>/dev/null)
+    case "$out" in
+        "ts-fix.settings="*) ;;
+        *) return 1 ;;
+    esac
+    ks_on=0
+    case "$out$nl" in
+        *"${nl}ts-fix.settings.kill_switch='1'$nl"*) ks_on=1 ;;
+    esac
+    return 0
+}
+# ---8<--- end ts_state
+
 # Kill-switch convergence on the two-layer model. All enforcement logic lives in
 # /usr/bin/ts-fix-ks; this only converges the installed router on the intent
 # that the config restore above put in place (committed state — the engine
@@ -202,6 +267,13 @@ fi
 # the table-100 route and any pre-v1.0.21 priority-5280 rules — and is
 # idempotent.
 #
+# Intent that cannot be read: neither call. The two reads below are the three-state ones
+# (ts_state and ks_state, defined above this comment): `uci -q get` prints nothing for a failed
+# read exactly as for an absent option, and taking that for "off" made this block run rules-clean
+# on an armed router being upgraded. On a failed read it logs one line and leaves the kill switch
+# as it is; the watchdog restarted above runs the engine's check every 5 s, which reads intent
+# itself, holds while it cannot, and converges the router once it can.
+#
 # Ordered before the ts-fix-reapply spawn at the end of this script: reapply
 # calls the same engine, but the engine serializes on its own lock and every
 # operation is idempotent, so whichever pass lands second is a cheap no-op.
@@ -212,8 +284,14 @@ fi
 # splat "not found" into opkg's output on either branch, the noise class of the
 # closed issue #5, while telling the user nothing. One loud syslog line instead.
 if [ -x /usr/bin/ts-fix-ks ]; then
-    if [ "$(uci -q get ts-fix.settings.kill_switch)" = "1" ] && \
-       [ "$(uci -q get tailscale.settings.enabled)" = "1" ]; then
+    ks_state
+    ts_state
+    if [ -z "$ks_on" ] || [ -z "$ts_en" ]; then
+        _unread=""
+        [ -z "$ks_on" ] && _unread="ts-fix.settings"
+        [ -z "$ts_en" ] && _unread="${_unread:+$_unread and }tailscale.settings"
+        logger -t ts-fix "postinst: $_unread could not be read - kill switch left as it is (neither arm nor rules-clean); the watchdog's check will converge it"
+    elif [ "$ks_on" = "1" ] && [ "$ts_en" = "1" ]; then
         /usr/bin/ts-fix-ks arm || logger -t ts-fix "postinst: ts-fix-ks arm rc $? - engine will retry via watchdog"
     else
         /usr/bin/ts-fix-ks rules-clean || logger -t ts-fix "postinst: ts-fix-ks rules-clean rc $? - kill-switch rule-layer rules may remain; watchdog check will retry"
@@ -262,5 +340,10 @@ fi
 if [ -x /usr/bin/ts-fix-reapply ]; then
     /usr/bin/ts-fix-reapply >/dev/null 2>&1 &
 fi
+
+# Bring the IPv6 half of GL's "Block WAN Subnets" in line with GL's rules now, rather than at the
+# next uplink event or the watchdog's next backstop pass. Detached: it may commit and reload the
+# firewall, and opkg need not wait for that.
+[ -x /usr/bin/ts-fix-isolate6 ] && ( /usr/bin/ts-fix-isolate6 sync ) </dev/null >/dev/null 2>&1 &
 
 exit 0

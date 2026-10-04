@@ -13,8 +13,15 @@ LOCK="/tmp/ts-fix-update.lock"
 STATUS="/tmp/ts-fix-update.status"
 CACHE="/tmp/ts-fix-latest-version"
 PLUGIN_CACHE="/tmp/ts-fix-plugin-latest-version"
-TS_BIN="/usr/sbin/tailscale"
-TS_DAEMON="/usr/sbin/tailscaled"
+# The binary, service and keep-list paths can be overridden from the environment so that
+# tests/unit/test-keep-binary.sh can point them into a temp dir; nothing sets them in production.
+TS_BIN=${TS_BIN:-/usr/sbin/tailscale}
+TS_DAEMON=${TS_DAEMON:-/usr/sbin/tailscaled}
+TS_INIT=${TS_INIT:-/etc/init.d/tailscale}
+# Restore copies the factory binaries from the read-only firmware image mounted here
+ROM_PREFIX=${ROM_PREFIX:-/rom}
+# Second keep list, present only while a Version Manager binary is installed (see keep_write)
+KEEP_BIN=${KEEP_BIN:-/lib/upgrade/keep.d/gl-tailscale-fix-tailscale}
 SYSUPGRADE_CONF="/etc/sysupgrade.conf"
 
 # Combined multi-call binaries hosted by Admonstrator
@@ -55,6 +62,66 @@ cleanup() {
         set_status "error" "Interrupted unexpectedly - check network and retry"
     fi
     rm -f "$LOCK"
+}
+
+# -- Keep list: carry the Tailscale binary across a firmware upgrade only while it is ours --
+#
+# A firmware upgrade that keeps settings copies every path a /lib/upgrade/keep.d list names that
+# exists, so a list naming the binaries carries the old firmware's own Tailscale over the new
+# firmware's (measured on a 4.8.5 → 4.9.0 upgrade). The static list no longer names them; KEEP_BIN
+# does, and exists only while a Version Manager binary is installed: written on install, removed on
+# Restore. It names itself too, so it survives the upgrade it governs and a second upgrade still
+# keeps the binary. It is written to a temp file in the same directory and renamed, so sysupgrade
+# never reads a half-written list. The temp name starts with a dot, which sysupgrade's
+# /lib/upgrade/keep.d/* glob does not match, so one left behind by a power cut lists nothing.
+# Both functions log and return 1 on failure; callers carry on, since the binary itself is fine.
+
+keep_write() {
+    local tmp="${KEEP_BIN%/*}/.${KEEP_BIN##*/}.tmp.$$"
+    if printf '%s\n' \
+        "# Written by /usr/bin/ts-fix-update when the Version Manager installed this Tailscale binary;" \
+        "# deleted on Restore." \
+        "$TS_DAEMON" "$TS_BIN" "$KEEP_BIN" 2>/dev/null > "$tmp" &&
+       mv -f "$tmp" "$KEEP_BIN" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null
+    logger -t ts-fix "ts-fix-update: could not write $KEEP_BIN - this Tailscale binary will not be kept across a firmware upgrade"
+    return 1
+}
+
+keep_remove() {
+    rm -f "$KEEP_BIN" 2>/dev/null && return 0
+    logger -t ts-fix "ts-fix-update: could not remove $KEEP_BIN - a firmware upgrade will still keep the installed Tailscale binary"
+    return 1
+}
+
+# Put a downloaded Version Manager binary in place — the combined binary as tailscaled, tailscale a
+# symlink to it — and list both for keeping across a firmware upgrade.
+install_binary() {
+    rm -f "$TS_BIN" "$TS_DAEMON"
+    mv "$1" "$TS_DAEMON"
+    chmod 755 "$TS_DAEMON"
+    ln -sf tailscaled "$TS_BIN"
+    keep_write || true
+}
+
+# -- Sync-keep mode: converge KEEP_BIN on what is installed (run by postinst) --
+#
+# Builds before v1.0.22 listed the binaries in the static keep list whatever had installed them.
+# The Version Manager installs Admonstrator's builds, whose `tailscale version` first line is the
+# full suffixed string (e.g. 1.98.8-tiny.by.admon.1320): keep those. Anything else is the
+# firmware's own binary, or a Restore of it, and the next firmware brings its own. Silent, exit 0.
+do_sync_keep() {
+    local first=""
+    if [ -e "$TS_DAEMON" ]; then
+        first=$(timeout 10 "$TS_BIN" version 2>/dev/null | head -n 1) || true
+    fi
+    case "$first" in
+        *-tiny.by.admon.*) keep_write || true ;;
+        *)                 keep_remove || true ;;
+    esac
+    return 0
 }
 
 # -- Check mode: query latest version and cache it --
@@ -191,19 +258,15 @@ do_install() {
     set_status "running" "Installing binaries..."
 
     # Stop tailscale
-    /etc/init.d/tailscale stop 2>/dev/null || true
+    "$TS_INIT" stop 2>/dev/null || true
     sleep 1
 
-    # Install combined binary + symlink
-    rm -f "$TS_BIN" "$TS_DAEMON"
-    mv "$tmpfile" "$TS_DAEMON"
-    chmod 755 "$TS_DAEMON"
-    ln -sf tailscaled "$TS_BIN"
+    # Install combined binary + symlink. install_binary also writes KEEP_BIN, the keep list that
+    # carries this binary across a firmware upgrade. The static keep.d/gl-tailscale-fix list no
+    # longer names the binaries (see the Keep list section above).
+    install_binary "$tmpfile"
 
-    # Binary persistence across sysupgrade handled by
-    # /lib/upgrade/keep.d/gl-tailscale-fix (declares /usr/sbin/tailscaled
-    # and /usr/sbin/tailscale). Clean up stale sysupgrade.conf entries
-    # from pre-v1.0.18 installations.
+    # Clean up stale sysupgrade.conf entries from pre-v1.0.18 installations.
     if [ -f "$SYSUPGRADE_CONF" ]; then
         sed -i "\|^${TS_BIN}$|d" "$SYSUPGRADE_CONF" 2>/dev/null
         sed -i "\|^${TS_DAEMON}$|d" "$SYSUPGRADE_CONF" 2>/dev/null
@@ -212,7 +275,7 @@ do_install() {
     set_status "running" "Restarting Tailscale..."
 
     # Restart tailscale
-    /etc/init.d/tailscale start 2>/dev/null || true
+    "$TS_INIT" start 2>/dev/null || true
 
     # Wait a moment for it to come up
     sleep 3
@@ -233,21 +296,25 @@ do_restore() {
 
     set_status "running" "Restoring factory binaries..."
 
-    if [ ! -f "/rom${TS_DAEMON}" ]; then
-        set_status "error" "Factory binary not found: /rom${TS_DAEMON}"
+    if [ ! -f "${ROM_PREFIX}${TS_DAEMON}" ]; then
+        set_status "error" "Factory binary not found: ${ROM_PREFIX}${TS_DAEMON}"
         exit 1
     fi
 
     # Stop tailscale
-    /etc/init.d/tailscale stop 2>/dev/null || true
+    "$TS_INIT" stop 2>/dev/null || true
     sleep 1
 
     # Restore from /rom/ (factory has tailscale as symlink to tailscaled —
     # cp -a preserves symlinks, so this recreates the factory layout)
     rm -f "$TS_BIN" "$TS_DAEMON"
-    cp -a "/rom${TS_BIN}" "$TS_BIN"
-    cp -a "/rom${TS_DAEMON}" "$TS_DAEMON"
+    cp -a "${ROM_PREFIX}${TS_BIN}" "$TS_BIN"
+    cp -a "${ROM_PREFIX}${TS_DAEMON}" "$TS_DAEMON"
     chmod 755 "$TS_DAEMON"
+
+    # The restored binaries equal the firmware's, so they must not be kept across a firmware
+    # upgrade: the next firmware brings its own. Stop listing them.
+    keep_remove || true
 
     # Clean up stale sysupgrade.conf entries (v1.0.18+ uses keep.d)
     if [ -f "$SYSUPGRADE_CONF" ]; then
@@ -256,7 +323,7 @@ do_restore() {
     fi
 
     # Restart
-    /etc/init.d/tailscale start 2>/dev/null || true
+    "$TS_INIT" start 2>/dev/null || true
     sleep 3
 
     local ver
@@ -267,17 +334,24 @@ do_restore() {
 
 # -- Main --
 
+# Library guard: tests/unit/test-keep-binary.sh sources this file with TS_FIX_UPDATE_LIB=1 to get
+# the functions above without running a mode. Never set in production.
+[ "${TS_FIX_UPDATE_LIB:-0}" = "1" ] && return 0
+
 case "$1" in
     --check)         do_check ;;
     --check-plugin)  do_check_plugin ;;
     --install)       do_install ;;
     --restore)       do_restore ;;
+    --sync-keep)     do_sync_keep ;;
     *)
-        echo "Usage: ts-fix-update [--check|--check-plugin|--install|--restore]"
+        echo "Usage: ts-fix-update [--check|--check-plugin|--install|--restore|--sync-keep]"
         echo "  --check         Check for latest Tailscale version (writes to $CACHE)"
         echo "  --check-plugin  Check for latest gl-tailscale-fix release from GitHub"
         echo "  --install       Download and install latest Tailscale"
         echo "  --restore       Restore factory Tailscale binaries from /rom/"
+        echo "  --sync-keep     Keep the installed Tailscale across firmware upgrades only if the"
+        echo "                  Version Manager installed it (writes or removes $KEEP_BIN)"
         exit 1
         ;;
 esac

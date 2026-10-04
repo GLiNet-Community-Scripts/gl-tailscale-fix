@@ -3,16 +3,79 @@
 # Re-applies ts-fix settings after GL's "tailscale up --reset" clears them.
 # Also handles teardown when Tailscale is disabled (mirrors GL's pattern in
 # 19-tailscale-iface: any hotplug event with enabled=0 triggers cleanup).
+# An event whose read of tailscale.settings fails does nothing at all: the read is UNKNOWN, not a
+# disable, and running reapply on it is what used to tear everything down off a failed read (see
+# ts_state below). The watchdog's next poll reads it again.
 # Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
 # https://github.com/RemoteToHome-io/gl-tailscale-fix
 
-enabled=$(uci -q get tailscale.settings.enabled)
+# ---8<--- ts_state
+# The kill switch's intent, read as the engine reads it (_ks_intent in /usr/bin/ts-fix-ks). This
+# block is byte-identical in ts-fix-watchdog, ts-fix-reapply, hotplug 20-ts-fix and postinst;
+# tests/unit/test-ts-state.sh holds the copies to that, and to the engine's meaning.
+#
+# `uci -q get` prints nothing and returns 1 both for an absent option and for a read that failed,
+# so it cannot tell "off" from "unknown", and a failed read taken for "off" tears protection down.
+# `uci -q show <pkg>.settings` can: a readable section prints its own "<pkg>.settings=<type>" line
+# first, and a failed read prints nothing. An option absent from a readable section is off (GL's
+# slider accessory deletes tailscale.settings.enabled to restore its never-set state); a failed read
+# is UNKNOWN, and no caller may act on it as off. Shell matching only: no fork beyond the uci call.
+#
+# ts_state — tailscale.settings, read once: ts_en is 1 when it holds enabled='1', 0 for any other
+# value or none, and EMPTY when the read failed (rc 1); ts_eip is exit_node_ip's value, empty when
+# absent, and means something only when ts_en is not empty. uci prints the value single-quoted, and
+# an address holds no quote of its own, so the outer pair is all there is to strip.
+ts_state() {
+    local out nl='
+'
+    ts_en=""
+    ts_eip=""
+    out=$(uci -q show tailscale.settings 2>/dev/null)
+    case "$out" in
+        "tailscale.settings="*) ;;
+        *) return 1 ;;
+    esac
+    ts_en=0
+    case "$out$nl" in
+        *"${nl}tailscale.settings.enabled='1'$nl"*) ts_en=1 ;;
+    esac
+    case "$out" in
+        *"${nl}tailscale.settings.exit_node_ip="*)
+            ts_eip=${out#*"${nl}tailscale.settings.exit_node_ip="}
+            ts_eip=${ts_eip%%"$nl"*}
+            ts_eip=${ts_eip#\'}
+            ts_eip=${ts_eip%\'}
+            ;;
+    esac
+    return 0
+}
 
-if [ "$ACTION" = "ifup" ] && [ "$enabled" = "1" ]; then
+# ks_state — ts-fix.settings, read once: ks_on is 1 when it holds kill_switch='1', 0 for any other
+# value or none, and EMPTY when the read failed (rc 1).
+ks_state() {
+    local out nl='
+'
+    ks_on=""
+    out=$(uci -q show ts-fix.settings 2>/dev/null)
+    case "$out" in
+        "ts-fix.settings="*) ;;
+        *) return 1 ;;
+    esac
+    ks_on=0
+    case "$out$nl" in
+        *"${nl}ts-fix.settings.kill_switch='1'$nl"*) ks_on=1 ;;
+    esac
+    return 0
+}
+# ---8<--- end ts_state
+
+ts_state || exit 0
+
+if [ "$ACTION" = "ifup" ] && [ "$ts_en" = "1" ]; then
     [ "$INTERFACE" = "loopback" ] && exit 0
     # Delegate to shared reapply script (handles locking, waiting, re-applying)
     /usr/bin/ts-fix-reapply
-elif [ "$enabled" != "1" ]; then
+elif [ "$ts_en" = "0" ]; then
     # Tailscale disabled — run teardown (ts-fix-reapply handles the disabled case)
     /usr/bin/ts-fix-reapply
 fi

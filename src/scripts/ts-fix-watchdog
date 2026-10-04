@@ -5,10 +5,13 @@
 # pass — the plugin's only periodic enforcement point for both kill-switch
 # layers, and the engine self-gates. (3) Reconciles a stuck daemon exit node (GL
 # UCI cleared but the daemon still routing — buggy tiny-binary builds).
-# (4) Enforces the opt-in ks_follow_exit_node preference. Necessary because
-# procd_add_reload_trigger does NOT work on GL firmware (uci commit does not
-# emit config.change events), so nothing else notifies ts-fix when Tailscale is
-# turned off.
+# (4) Enforces the opt-in ks_follow_exit_node preference. (5) Restores the
+# tailscale0 zone's masquerade, which a Tailscale off/on through GL drops.
+# (6) Applies Route Guest's swap of GL's guest source rule when no event did.
+# (7) Every sixth poll, re-syncs the IPv6 half of GL's "Block WAN Subnets".
+# Necessary because procd_add_reload_trigger does NOT work on GL firmware (uci
+# commit does not emit config.change events), so nothing else notifies ts-fix
+# when Tailscale is turned off.
 #
 # Design C: the kill switch is NOT torn down on exit-node removal — only on a
 # Tailscale disable (here) or the user turning the KS toggle off (RPC/reapply).
@@ -36,32 +39,289 @@ command -v timeout >/dev/null 2>&1 || timeout() { shift; "$@"; }
 stuck_polls=0
 set_stuck_polls=0
 
-# Clean-exit discipline for procd stops/restarts (idiom shared with
-# gl-zerotier-fix): trap TERM/INT to exit 0, with the sleep backgrounded and
-# wait'ed so the trap fires immediately. Measured on the MT3000: the previous
-# plain `sleep 5` with NO trap also died instantly on TERM (default signal
-# disposition kills ash even mid-wait), so this does not fix a slow stop —
-# it makes the exit a clean 0 instead of a signaled death, handles INT for
-# interactive runs, and keeps stops instant if a cleanup trap is ever added:
-# a trap WITHOUT the backgrounded sleep defers the handler until the sleep
-# returns, which is exactly the slow-stop failure the sibling plugin hit.
-trap 'exit 0' TERM INT
+# tailscale0 masquerade (v1.0.22). Turning Tailscale off and on through GL — its settings RPC,
+# `gl_tailscale restart`, the slider accessory — leaves the tailscale0 zone without masq and masq6,
+# and LAN/guest devices then get no internet through a Custom Exit Node until something re-applies
+# them. Measured 2026-10-02 on GL 4.11.0 and 4.9.0 with the kill switch off: both options absent for
+# 55 s and more after an off/on, LAN pings through the exit node 0/57 on IPv4 and on IPv6; with masq
+# alone restored and a firewall reload, IPv4 57/57.
+#
+# GL's own code drops them. On disable /etc/firewall.tailscale.sh deletes the zone section, options
+# and all; on enable its add_zone recreates the section without either. gl_tailscale starts that
+# script in the background and at once sets masq when its IP Masquerading toggle is on — against a
+# section the script has not recreated yet, so the set fails, and the commit and the firewall
+# restart that follow carry nothing. GL never sets masq6. Reapply's early block re-applies both, but
+# only if the zone exists at that instant, and on an off/on that pass usually runs before GL has
+# recreated it. Nothing came back later to look again; this does, on every poll.
+#
+# Ownership is reapply's, unchanged. masq6 is the plugin's on all firmware. masq is the plugin's
+# before 4.9 and GL's toggle's (tailscale.settings.masq) from 4.9 on, so there it is written only to
+# finish GL's own failed write — toggle 1, zone value not 1 — and never set or cleared otherwise:
+# with the toggle off GL sets an existing zone value to 0 itself, and an option the plugin created
+# would make every later GL Tailscale restart restart the firewall too.
+#
+# Cost: nothing while Tailscale is off, at most four `uci -q get` per poll while it is on, and a
+# commit, a firewall reload (not a restart) and one log line only on a poll that restored something.
+# A write that does not take — the commit fails, or a value still does not read back as 1 (a full
+# or read-only overlay, or GL deleting the zone in between) — logs one ERROR and is not retried for
+# the next 11 polls: at one 5 s sleep per poll the next attempt is 60 s or more later, never a
+# reload every 5 seconds. Both checks are needed: `uci get` serves changes still staged in /tmp/.uci,
+# and a commit that fails opening the config file leaves them staged, so a failed commit can still
+# read back as 1 (uci 2021-04-14, source read from GL 4.9.0's build tree).
+#
+# Test seams: tests/unit/test-wd-masq.sh points these at fakes; nothing else sets them.
+TS_FIX_GLVERSION=${TS_FIX_GLVERSION:-/etc/glversion}
+TS_FIX_FW_INIT=${TS_FIX_FW_INIT:-/etc/init.d/firewall}
 
-while true; do
-    sleep 5 &
-    wait $!
-    curr=$(uci -q get tailscale.settings.enabled)
+# Copied from ts-fix-reapply so the two agree on where 4.9 begins (the test compares the copies);
+# only the glversion path is a variable here.
+is_fw49_plus() {
+    local fw_ver major minor
+    fw_ver=$(awk '{print $1}' "$TS_FIX_GLVERSION" 2>/dev/null)
+    [ -z "$fw_ver" ] && return 1  # non-GL firmware — treat as < 4.9
+    major=$(echo "$fw_ver" | cut -d. -f1)
+    minor=$(echo "$fw_ver" | cut -d. -f2)
+    if [ "$major" -gt 4 ] 2>/dev/null || \
+       { [ "$major" -eq 4 ] && [ "$minor" -ge 9 ]; } 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Once, before the loop: the firmware version changes only across a sysupgrade, which reboots and so
+# restarts the watchdog.
+if is_fw49_plus; then masq_fw49=1; else masq_fw49=0; fi
+masq_backoff=0
+
+# ensure_ts0_masq <tailscale.settings.enabled as this poll read it> -> rc 0, or 1 after a write that
+# did not take (ERROR logged, back-off armed).
+ensure_ts0_masq() {
+    local what="" bad="" crc o
+    if [ "$masq_backoff" -gt 0 ]; then
+        masq_backoff=$((masq_backoff - 1))
+        return 0
+    fi
+    [ "$1" = "1" ] || return 0
+    [ "$(uci -q get firewall.tailscale0)" = "zone" ] || return 0
+    if [ "$masq_fw49" = "1" ]; then
+        if [ "$(uci -q get tailscale.settings.masq)" = "1" ] && \
+           [ "$(uci -q get firewall.tailscale0.masq)" != "1" ]; then
+            uci set firewall.tailscale0.masq=1
+            what="masq"
+        fi
+    elif [ "$(uci -q get firewall.tailscale0.masq)" != "1" ]; then
+        uci set firewall.tailscale0.masq=1
+        what="masq"
+    fi
+    if [ "$(uci -q get firewall.tailscale0.masq6)" != "1" ]; then
+        uci set firewall.tailscale0.masq6=1
+        what="${what:+$what }masq6"
+    fi
+    [ -n "$what" ] || return 0
+    uci commit firewall
+    crc=$?
+    for o in $what; do
+        [ "$(uci -q get "firewall.tailscale0.$o")" = "1" ] || bad="${bad:+$bad }$o"
+    done
+    "$TS_FIX_FW_INIT" reload >/dev/null 2>&1
+    if [ "$crc" = "0" ] && [ -z "$bad" ]; then
+        logger -t ts-fix "tailscale0 masquerade restored ($what) - missing from the zone (GL drops it on a Tailscale off/on)"
+        return 0
+    fi
+    masq_backoff=11
+    logger -t ts-fix "ERROR tailscale0 masquerade ($what) not restored (commit rc $crc, still not 1: ${bad:-none}) - overlay full or read-only? Retrying in a minute"
+    return 1
+}
+
+# Route Guest, enforced headlessly (v1.0.22). When a Custom Exit Node is set and the guest network
+# is enabled, GL's gl_tailscale adds "from <guest net> lookup main" at priority 0, which sends guest
+# traffic past the exit node to the real uplink. Route Guest replaces it with "to <guest net> lookup
+# main" — but until now only from paths that need an event: the page script's post-Apply
+# set_config, or an ifup that runs ts-fix-reapply. An exit node chosen from the GL app or GoodCloud
+# raises neither, and guest traffic then left on the real uplink for as long as the disarmed router
+# stayed up (measured >= 209 s). Armed, the kill-switch engine's own swap already covers it; this
+# covers the disarmed case and is idempotent with the engine. GL's iot source rule is left alone:
+# Route Guest covers the guest network only.
+#
+# guest_net comes from reapply's tested helper block, loaded the way pkg/prerm loads it: the eval
+# runs nothing but the marked block of our own root-owned package file. Without it (or with no IPv4
+# address on br-guest) the swap is skipped on every poll.
+#
+# Test seams: tests/unit/test-wd-guest.sh points TS_FIX_REAPPLY, TS_FIX_ISOLATE6 and the helper
+# block's IPCALC at fakes; nothing else sets them.
+eval "$(awk '/^# ---8<--- guest_net/,/^# ---8<--- end guest_net/' "${TS_FIX_REAPPLY:-/usr/bin/ts-fix-reapply}" 2>/dev/null)"
+
+# _wd_rg_rule <ip -4 rule list priority 0 output> from|to <NET/PFX> -> rc 0 when one of its lines
+# is exactly GL's source rule, "0: from <net> lookup main", or exactly Route Guest's destination
+# rule, "0: from all to <net> lookup main": whole tokens and whole lines, as the kill-switch
+# engine's _ks_src_rule matches the same two rules, so a rule carrying any other selector or table
+# is never taken for either. That matters for the delete above all, because the kernel's delete
+# ignores a selector the request does not give.
+_wd_rg_rule() {
+    printf '%s\n' "$1" | awk -v k="$2" -v n="$3" '
+        k == "from" && NF == 5 && $1 == "0:" && $2 == "from" && $3 == n && $4 == "lookup" && $5 == "main" { f = 1 }
+        k == "to" && NF == 7 && $1 == "0:" && $2 == "from" && $3 == "all" && $4 == "to" && $5 == n && $6 == "lookup" && $7 == "main" { f = 1 }
+        END { exit !f }'
+}
+
+# ensure_route_guest_swap <tailscale.settings.enabled as this poll read it> -> rc 0. A quiet poll
+# costs one uci read and one `ip -4 rule list`, matched in the shell: br-guest's network (an
+# `ip addr` and an ipcalc) is derived only once that list holds some "from <address>" rule — GL's
+# guest rule, or on 4.9+ its iot rule, which then costs those two on every poll while it stands.
+# The delete and the add are the engine's command forms. The delete names priority 0, so a rule
+# with the same selector at another priority is never taken, and repeats while the list read back
+# after it still shows GL's rule, at most 5 times. One line per swap: the replaced line only when
+# that read-back shows GL's rule gone and the destination rule present, else one ERROR naming what
+# is left. A failed add is read back once before it counts, since reapply and the RPC delete and
+# re-add the same destination rule and may have run in between.
+ensure_route_guest_swap() {
+    local list gnet i=0 msg=""
+    [ "$1" = "1" ] || return 0
+    [ "$(uci -q get ts-fix.settings.route_guest)" = "1" ] || return 0
+    list=$(ip -4 rule list priority 0 2>/dev/null) || return 0
+    case "$list" in
+        *"from "[0-9]*) ;;
+        *) return 0 ;;
+    esac
+    command -v guest_net >/dev/null 2>&1 || return 0
+    gnet=$(guest_net)
+    [ -n "$gnet" ] || return 0
+    while [ "$i" -lt 5 ] && _wd_rg_rule "$list" from "$gnet"; do
+        ip -4 rule del priority 0 from "$gnet" lookup main 2>/dev/null
+        i=$((i + 1))
+        if ! list=$(ip -4 rule list priority 0 2>/dev/null); then
+            logger -t ts-fix "ERROR Route Guest: 'ip -4 rule list priority 0' failed after deleting GL's guest source rule (from $gnet) - the destination rule was not checked"
+            return 0
+        fi
+    done
+    [ "$i" -gt 0 ] || return 0
+    _wd_rg_rule "$list" from "$gnet" && msg="GL's guest source rule (from $gnet) still present after $i deletes"
+    if ! _wd_rg_rule "$list" to "$gnet" && ! ip -4 rule add to "$gnet" lookup main priority 0 2>/dev/null &&
+       ! _wd_rg_rule "$(ip -4 rule list priority 0 2>/dev/null)" to "$gnet"; then
+        msg="${msg:+$msg; }the destination rule (to $gnet) could not be added"
+    fi
+    if [ -n "$msg" ]; then
+        logger -t ts-fix "ERROR Route Guest: $msg"
+    else
+        logger -t ts-fix "Route Guest: replaced GL's guest source rule (from $gnet) with the destination rule"
+    fi
+    return 0
+}
+
+# IPv6 half of GL's "Block WAN Subnets" (ts-fix-isolate6, v1.0.22). Its hotplug follows every
+# uplink event; this backstop catches what no event announces (GL's toggle flipped in the UI, a
+# prefix that changed without an ifupdate) every sixth poll, about 30 s. Independent of Tailscale's
+# state: it completes a GL feature, not a Tailscale one. The script logs its own changes and
+# errors, so its output and rc are discarded here, and one missing or not executable is skipped.
+iso6_poll=0
+
+# iso6_backstop -> rc 0. Called once per poll; the first sync runs on the sixth.
+iso6_backstop() {
+    iso6_poll=$(( (iso6_poll + 1) % 6 ))
+    [ "$iso6_poll" = "0" ] || return 0
+    [ -x "${TS_FIX_ISOLATE6:-/usr/bin/ts-fix-isolate6}" ] || return 0
+    "${TS_FIX_ISOLATE6:-/usr/bin/ts-fix-isolate6}" sync </dev/null >/dev/null 2>&1
+    return 0
+}
+
+# ---8<--- ts_state
+# The kill switch's intent, read as the engine reads it (_ks_intent in /usr/bin/ts-fix-ks). This
+# block is byte-identical in ts-fix-watchdog, ts-fix-reapply, hotplug 20-ts-fix and postinst;
+# tests/unit/test-ts-state.sh holds the copies to that, and to the engine's meaning.
+#
+# `uci -q get` prints nothing and returns 1 both for an absent option and for a read that failed,
+# so it cannot tell "off" from "unknown", and a failed read taken for "off" tears protection down.
+# `uci -q show <pkg>.settings` can: a readable section prints its own "<pkg>.settings=<type>" line
+# first, and a failed read prints nothing. An option absent from a readable section is off (GL's
+# slider accessory deletes tailscale.settings.enabled to restore its never-set state); a failed read
+# is UNKNOWN, and no caller may act on it as off. Shell matching only: no fork beyond the uci call.
+#
+# ts_state — tailscale.settings, read once: ts_en is 1 when it holds enabled='1', 0 for any other
+# value or none, and EMPTY when the read failed (rc 1); ts_eip is exit_node_ip's value, empty when
+# absent, and means something only when ts_en is not empty. uci prints the value single-quoted, and
+# an address holds no quote of its own, so the outer pair is all there is to strip.
+ts_state() {
+    local out nl='
+'
+    ts_en=""
+    ts_eip=""
+    out=$(uci -q show tailscale.settings 2>/dev/null)
+    case "$out" in
+        "tailscale.settings="*) ;;
+        *) return 1 ;;
+    esac
+    ts_en=0
+    case "$out$nl" in
+        *"${nl}tailscale.settings.enabled='1'$nl"*) ts_en=1 ;;
+    esac
+    case "$out" in
+        *"${nl}tailscale.settings.exit_node_ip="*)
+            ts_eip=${out#*"${nl}tailscale.settings.exit_node_ip="}
+            ts_eip=${ts_eip%%"$nl"*}
+            ts_eip=${ts_eip#\'}
+            ts_eip=${ts_eip%\'}
+            ;;
+    esac
+    return 0
+}
+
+# ks_state — ts-fix.settings, read once: ks_on is 1 when it holds kill_switch='1', 0 for any other
+# value or none, and EMPTY when the read failed (rc 1).
+ks_state() {
+    local out nl='
+'
+    ks_on=""
+    out=$(uci -q show ts-fix.settings 2>/dev/null)
+    case "$out" in
+        "ts-fix.settings="*) ;;
+        *) return 1 ;;
+    esac
+    ks_on=0
+    case "$out$nl" in
+        *"${nl}ts-fix.settings.kill_switch='1'$nl"*) ks_on=1 ;;
+    esac
+    return 0
+}
+# ---8<--- end ts_state
+
+# 1 while the polls' read of tailscale.settings keeps failing, so that is logged once per episode.
+wd_unread=0
+
+# wd_poll — one poll of the loop below: everything the watchdog does, in order.
+#
+# tailscale.settings is read ONCE per poll (ts_state, above), and curr and every exit_node_ip use
+# in the poll come from that one snapshot. A snapshot that could not be read is UNKNOWN: curr is
+# empty, so the teardown (which needs an explicit 0) does not run, and neither does anything that
+# needs curr to be 1 — follow mode, the masquerade and Route Guest repairs, the daemon retry, the
+# domain re-assert, and both exit-node reconciles. The kill-switch engine's check still runs; it
+# reads intent itself and holds on its own failed read. Logged once per episode, and once more when
+# the read recovers. Library mode (TS_FIX_WD_LIB=1) gets this function without the loop, which is
+# how tests/unit/test-ts-state.sh runs one poll at a time.
+wd_poll() {
+    ts_state
+    curr=$ts_en
+    if [ -z "$curr" ]; then
+        if [ "$wd_unread" != "1" ]; then
+            logger -t ts-fix "WARNING tailscale.settings could not be read - holding: no teardown and no exit-node reconcile until it reads again"
+            wd_unread=1
+        fi
+    elif [ "$wd_unread" = "1" ]; then
+        logger -t ts-fix "tailscale.settings readable again - resuming"
+        wd_unread=0
+    fi
 
     # Detect Tailscale disabled while any ts-fix setting is still applied → teardown. Idempotent:
     # keeps firing until teardown clears the state, and reapply's teardown resets exactly these
     # four intent flags to 0, so a converged router reads them all 0 and every later poll no-ops.
+    # Only on an explicit off (curr 0, the option '0' or absent): an unknown read is not a disable,
+    # and the teardown it used to trigger committed kill_switch=0.
     #
     # This reads intent rather than probing the kill switch itself, which makes it a strict
     # superset of the RPDB-era rule probe it replaced: that one could only fire while the kill
     # switch was armed. Neither kill-switch layer — the severed forwardings in flash-persisted
     # firewall UCI, nor the priority-5279 rules and their table-100 route — is checked here: the
     # ts-fix-ks check pass below owns both, in both directions, on every poll.
-    if [ "$curr" != "1" ] && uci -q show ts-fix.settings 2>/dev/null | \
+    if [ "$curr" = "0" ] && uci -q show ts-fix.settings 2>/dev/null | \
        grep -qE "\.(kill_switch|route_guest|advertise_exit_node|tailscale_ssh)='1'"; then
         logger -t ts-fix "Tailscale disabled + ts-fix settings still applied — running teardown"
         /usr/bin/ts-fix-reapply
@@ -75,10 +335,11 @@ while true; do
     # still never disarms on exit-node removal. Note: on some pre-4.9 firmware
     # GL may leave a stale exit_node_ip after disabling Custom Exit Node — in
     # that case follow mode keeps the KS armed (blocked, not leaked; clear the
-    # Custom Exit Node selection to disarm).
+    # Custom Exit Node selection to disarm). exit_node_ip is the poll's snapshot: a separate read
+    # that failed would print nothing and pass for "exit node cleared", a durable disarm.
     if [ "$curr" = "1" ] && \
        [ "$(uci -q get ts-fix.settings.ks_follow_exit_node)" = "1" ]; then
-        eip=$(uci -q get tailscale.settings.exit_node_ip)
+        eip=$ts_eip
         ks=$(uci -q get ts-fix.settings.kill_switch)
         if [ -n "$eip" ] && [ "$ks" != "1" ]; then
             logger -t ts-fix "ks_follow_exit_node: exit node configured — arming kill switch"
@@ -112,6 +373,17 @@ while true; do
     # No rc handling: the engine ERROR-logs its own failures on every attempt and the next poll is
     # the retry, so a line here would only double the log volume every 5 seconds.
     /usr/bin/ts-fix-ks check
+
+    # tailscale0 masquerade repair (ensure_ts0_masq, above): after the kill-switch pass, so it can
+    # never hold that pass up. A quiet poll costs at most four uci reads and writes nothing.
+    ensure_ts0_masq "$curr"
+
+    # Route Guest, enforced headlessly (ensure_route_guest_swap, above): after the kill-switch
+    # pass, so on an armed router the engine's own swap has already run when this one looks.
+    ensure_route_guest_swap "$curr"
+
+    # IPv6 half of GL's "Block WAN Subnets", every sixth poll (iso6_backstop, above).
+    iso6_backstop
 
     # Daemon-settings retry: reapply's Running-wait can expire on cold boot (modem still coming
     # up, NTP not yet synced) and boot's other ifup reapplies are swallowed by its flock — the
@@ -175,8 +447,10 @@ while true; do
     # set manually via "tailscale set --exit-node=<ip>" (bypassing GL's UI) is
     # reconciled away too. GL's UI is the supported control surface, and
     # enforcing it also clears the documented stale-exit-node startup blackout.
+    # exit_node_ip comes from the poll's snapshot, so a read of it that failed
+    # can never pass for "cleared" here.
     if [ "$curr" = "1" ] && \
-       [ -z "$(uci -q get tailscale.settings.exit_node_ip)" ] && \
+       [ -z "$ts_eip" ] && \
        ip -4 route show table 52 2>/dev/null | grep -q "^default" && \
        pgrep tailscaled >/dev/null 2>&1; then
         stuck_polls=$((stuck_polls + 1))
@@ -199,13 +473,13 @@ while true; do
     # state — a daemon that is not Running (starting, NeedsLogin) is skipped and re-checked, and
     # so is one whose status call times out (cut off after 10s, it reads as not Running).
     if [ "$curr" = "1" ] && \
-       [ -n "$(uci -q get tailscale.settings.exit_node_ip)" ] && \
+       [ -n "$ts_eip" ] && \
        ! ip -4 route show table 52 2>/dev/null | grep -q "^default" && \
        pgrep tailscaled >/dev/null 2>&1; then
         set_stuck_polls=$((set_stuck_polls + 1))
         if [ "$set_stuck_polls" -ge 3 ]; then
             if [ "$(timeout 10 /usr/sbin/tailscale status --json 2>/dev/null | jsonfilter -e '@.BackendState' 2>/dev/null)" = "Running" ]; then
-                eip=$(uci -q get tailscale.settings.exit_node_ip)
+                eip=$ts_eip
                 logger -t ts-fix "Exit node set in GL config but daemon not routing one (no table 52 default) — reconciling"
                 timeout 10 /usr/sbin/tailscale set --exit-node="$eip" 2>/dev/null
             fi
@@ -214,5 +488,27 @@ while true; do
     else
         set_stuck_polls=0
     fi
+}
 
+# Library guard: tests/unit/test-wd-masq.sh, test-wd-guest.sh and test-ts-state.sh source this file
+# with TS_FIX_WD_LIB=1 to get the functions above without arming the trap or entering the poll loop
+# (the engine's TS_FIX_KS_NO_MAIN is the same idea). Never set in production, where procd starts the
+# watchdog.
+[ "${TS_FIX_WD_LIB:-0}" = "1" ] && return 0
+
+# Clean-exit discipline for procd stops/restarts (idiom shared with
+# gl-zerotier-fix): trap TERM/INT to exit 0, with the sleep backgrounded and
+# wait'ed so the trap fires immediately. Measured on the MT3000: the previous
+# plain `sleep 5` with NO trap also died instantly on TERM (default signal
+# disposition kills ash even mid-wait), so this does not fix a slow stop —
+# it makes the exit a clean 0 instead of a signaled death, handles INT for
+# interactive runs, and keeps stops instant if a cleanup trap is ever added:
+# a trap WITHOUT the backgrounded sleep defers the handler until the sleep
+# returns, which is exactly the slow-stop failure the sibling plugin hit.
+trap 'exit 0' TERM INT
+
+while true; do
+    sleep 5 &
+    wait $!
+    wd_poll
 done

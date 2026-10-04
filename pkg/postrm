@@ -15,6 +15,49 @@
 # second one here when the environment says so.
 [ "$PKG_UPGRADE" = "1" ] && exit 0
 
+# Removed, not upgraded: stop keeping a Version Manager Tailscale binary across firmware upgrades.
+rm -f /lib/upgrade/keep.d/gl-tailscale-fix-tailscale
+
+# Remove the IPv6 half of GL's "Block WAN Subnets" this package added (ts-fix-isolate6 is already
+# deleted by now, so inline uci). Only sections of type rule named ts_fix_*_isolate6; GL's own
+# IPv4 isolate rules are GL's and stay. Commit only when one existed, and reload only after the
+# commit succeeded: a reload after a failed commit would apply a config that is not in flash.
+#
+# All of it runs under ts-fix-isolate6's own lock, taken BLOCKING on fd 9. A sync already running
+# (started by hotplug 98, the watchdog's backstop or postinst before opkg deleted the files)
+# finishes first, and its rules are then deleted here; a sync starting meanwhile finds the lock
+# held and skips; one that gets the lock after this finds its own file gone and does nothing. Fail
+# open on the lock, never on the cleanup: without a lock file or a working flock the rules are
+# still deleted, unserialized, with a WARNING. `touch` gates the `exec`, since a failed redirection
+# on `exec` ends the script in dash and BusyBox ash. The fd is shed from the firewall reload and
+# closed before the nginx restart below, which would otherwise inherit it and hold the lock for as
+# long as nginx runs.
+_iso6=0
+_iso6_lock=/tmp/ts-fix-isolate6.lock
+if touch "$_iso6_lock" 2>/dev/null; then
+    exec 9>"$_iso6_lock"
+    flock 9 2>/dev/null ||
+        logger -t ts-fix "postrm: WARNING flock on $_iso6_lock failed (rc $?) - removing the IPv6 isolate rules unserialized"
+else
+    logger -t ts-fix "postrm: WARNING cannot create $_iso6_lock - removing the IPv6 isolate rules unserialized"
+fi
+for _s in $(uci -q show firewall | sed -n 's/^firewall\.\(ts_fix_[A-Za-z0-9_]*_isolate6\)=rule$/\1/p'); do
+    if uci -q delete "firewall.$_s"; then
+        _iso6=1
+    else
+        logger -t ts-fix "postrm: could not delete $_s - IPv6 isolate rule left in place"
+    fi
+done
+if [ "$_iso6" = "1" ]; then
+    if uci commit firewall; then
+        /etc/init.d/firewall reload >/dev/null 2>&1 9>&-
+    else
+        logger -t ts-fix "postrm: uci commit firewall failed - IPv6 isolate rules removed in staging only, firewall not reloaded"
+    fi
+fi
+exec 9>&-
+rm -f "$_iso6_lock"
+
 # Ordered stop → wait → escalate → start. A bare "kill -9 + start" can race a
 # not-yet-released listen socket and leave nginx down, which takes the admin UI
 # with it.

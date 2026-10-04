@@ -19,8 +19,9 @@
 #   netifd's start (boot, network restart), which wipes every policy rule and leaves the UCI zone
 #   layer standing.
 #
-#   Source-rule swap — part of the rule layer. Whenever a Custom Exit Node is set and the guest
-#   (or, on 4.9+, iot) network is enabled, GL adds "from <that network> table main" with no
+#   Source-rule swap — part of the rule layer. Whenever Tailscale is enabled, the router is in
+#   Router mode (glconfig.general.mode 'router'), a Custom Exit Node is set and the guest (or, on
+#   4.9+, iot) network is enabled, GL adds "from <that network> table main" with no
 #   priority. It lands at priority 0, ahead of everything above, and sends that network's traffic
 #   through the main table to the real uplink, so 5279 is never consulted for it. While armed, the
 #   engine deletes that rule and ensures "to <network> lookup main priority 0" in its place — the
@@ -98,8 +99,10 @@ ks_pair_in() {
 #
 # Subcommand exit status, honoured by every caller (reapply, watchdog, RPC, postinst, prerm):
 #   0  the requested state is in place
-#   1  the engine could NOT make it so — a uci write or commit failed, or the firewall config
-#      could not be enumerated. The kill switch must be treated as NOT effective.
+#   1  the engine could NOT make it so — a uci write or commit failed, a firewall reload failed,
+#      the firewall config could not be enumerated, or the armed intent could not be read (see
+#      _ks_intent: a failed read is never taken for "off", so nothing was changed). The kill
+#      switch must be treated as NOT effective.
 #   2  refused: arm on a router that is not in Router mode, and preboot run anywhere but at boot
 #      (see ks_main).
 # =================================================================================================
@@ -136,6 +139,15 @@ _ks_fwd=""
 # in tmpfs deliberately: after a reboot the uncommitted delta is gone too, and the normal sweep
 # re-severs from scratch.
 KS_COMMIT_FAIL="/tmp/ts-fix-ks.commit-failed"
+
+# A firewall reload that fails leaves the committed change in flash but NOT in the running
+# firewall, so the zone layer is not in force; and since the passes below commit and reload only
+# when something changed, nothing would ever retry it. This flag records the failure, with the
+# number of failures in a row (see _ks_reload), so that every arm, disarm and check retries the
+# reload until one succeeds — the reload alone when nothing is staged, never a commit, so a reload
+# that keeps failing costs no flash write per poll. tmpfs, like the commit flag: a reboot starts
+# the firewall from the committed config.
+KS_RELOAD_FAIL="/tmp/ts-fix-ks.reload-failed"
 
 # The engine has three asynchronous invokers — the RPC's detached arm/disarm spawn, the watchdog's
 # 5s check, and reapply on hotplug — so ks_main serializes the mutating subcommands on this lock.
@@ -183,6 +195,12 @@ KS_SWAP_ZONES="guest:br-guest iot:br-iot"
 KS_SWAP_MARK=/tmp/ts-fix-ks.srcswap
 KS_IPCALC=/bin/ipcalc.sh
 
+# GL's Tor script. disarm only reads it, to learn whether this firmware's Tor also turns
+# firewall.guestzone_fwd off (ks_disarm says why). A plain constant for the same reason as
+# KS_IPCALC: the engine takes no path from its environment (the unit test overrides it after
+# sourcing).
+KS_TOR_SCRIPT=/usr/bin/tor.sh
+
 # Fingerprint of the scope holes last reported by _ks_scope_warn, so a standing hole is logged once
 # rather than on every 5s poll. tmpfs, like the sentinel above: after a reboot the warning is worth
 # re-stating anyway.
@@ -191,6 +209,11 @@ KS_SCOPEWARN="/tmp/ts-fix-ks.scopewarn"
 # The same for the runtime invariant's one warning: the default-route devices that map to no uci
 # interface, as last reported by _ks_defroute_warn.
 KS_DEFROUTEWARN="/tmp/ts-fix-ks.defroutewarn"
+
+# Present while the intent cannot be read (see _ks_intent): check logs its WARNING when it creates
+# this file, once per episode rather than on every 5s poll, and the first check that reads the
+# intent again removes it with one line. tmpfs, like the fingerprints above.
+KS_INTENTWARN="/tmp/ts-fix-ks.intentwarn"
 
 # Capture the firewall config once per invocation and derive the forwarding sections from it; rc 1
 # when that list came back EMPTY. Empty is never "nothing to do": a GL router with Tailscale
@@ -280,13 +303,70 @@ _ks_mode_refused() {
     [ -n "$_ks_mode" ] && [ "$_ks_mode" != "router" ]
 }
 
+# _ks_optv "<uci show output>" <pkg>.<section>.<option> — sets _ks_v to that option's value exactly
+# as `uci show` prints it, quotes included ('1'), or to empty when the output has no such line. A
+# line is the option's only when it starts with the whole key and "="; matched by the shell alone.
+_ks_v=""
+_ks_optv() {
+    local s nl='
+'
+    s="$nl$1"
+    _ks_v=""
+    case "$s" in
+        *"$nl$2="*)
+            _ks_v="${s#*"$nl$2="}"
+            _ks_v="${_ks_v%%"$nl"*}"
+            ;;
+    esac
+}
+
 # Armed intent, in one place: the user's kill_switch toggle AND Tailscale being enabled. This is
 # design C unchanged — nothing here reads the daemon's exit-node state, so a transient or stale
 # ExitNodeID can neither arm nor disarm the kill switch.
+#
+# rc 0 armed intent, 1 no intent, 2 UNKNOWN. `uci -q get` prints nothing and returns 1 both for an
+# absent option and for a read that failed, so a failed read would pass for "off" and take the
+# protection down. Each package is read once with `uci -q show <pkg>.settings` instead, which prints
+# the section's own "<pkg>.settings=<type>" line first whenever the section could be read; output
+# that does not start with that line is a failed read, and the answer is 2, on which every caller
+# holds and changes nothing. In a readable section an option is on only as exactly '1'; any other
+# value, or none at all, is off — GL's slider accessory deletes tailscale.settings.enabled to
+# restore its never-set state. So rc 1 means both reads succeeded. The values as read are left in
+# _ks_intent_ks and _ks_intent_en (as uci prints them, empty when absent), and the sections that
+# could not be read in _ks_unread. The scripts outside the engine read intent the same way through
+# their shared ts_state helper; tests/unit/test-ts-state.sh holds the two to one meaning.
+_ks_intent_ks=""
+_ks_intent_en=""
+_ks_unread=""
 _ks_intent() {
-    [ "$(uci -q get ts-fix.settings.kill_switch)" = "1" ] || return 1
-    [ "$(uci -q get tailscale.settings.enabled)" = "1" ] || return 1
-    return 0
+    local ks ts
+    ks=$(uci -q show ts-fix.settings 2>/dev/null)
+    ts=$(uci -q show tailscale.settings 2>/dev/null)
+    _ks_unread=""
+    case "$ks" in "ts-fix.settings="*) ;; *) _ks_unread="ts-fix.settings" ;; esac
+    case "$ts" in "tailscale.settings="*) ;; *) _ks_unread="${_ks_unread:+$_ks_unread and }tailscale.settings" ;; esac
+    _ks_optv "$ks" ts-fix.settings.kill_switch
+    _ks_intent_ks="$_ks_v"
+    _ks_optv "$ts" tailscale.settings.enabled
+    _ks_intent_en="$_ks_v"
+    [ -z "$_ks_unread" ] || return 2
+    [ "$_ks_intent_ks" = "'1'" ] && [ "$_ks_intent_en" = "'1'" ]
+}
+
+# check's side of an unknown intent: one WARNING per episode (KS_INTENTWARN), then silence. The
+# flag's existence is all it says, so it is made with touch, as the commit flag is (_ks_commit says
+# why not with a redirection).
+_ks_intent_hold() {
+    [ -f "$KS_INTENTWARN" ] && return 0
+    logger -t ts-fix "ks: WARNING $_ks_unread could not be read - holding: the kill switch is left exactly as it is (nothing armed, disarmed or removed) until it reads again"
+    touch "$KS_INTENTWARN" 2>/dev/null
+}
+
+# ... and after a readable intent: an episode in progress ends, in one line. A file test otherwise.
+_ks_intent_ok() {
+    [ -f "$KS_INTENTWARN" ] || return 0
+    rm -f "$KS_INTENTWARN"
+    logger -t ts-fix "ks: kill-switch intent readable again - checks resume"
 }
 
 # Single call site for the firewall reload. The severing itself is already persisted by the uci
@@ -298,21 +378,54 @@ _ks_intent() {
 # package removal in this project before.
 _fw_reload() { /etc/init.d/firewall reload >/dev/null 2>&1 9>&-; }
 
+# _ks_reload — the firewall reload, with its failure remembered (KS_RELOAD_FAIL). On success it
+# removes the flag, logging one line if a failure had been recorded. On failure it writes the number
+# of failures in a row to the flag and logs an ERROR on the first and on every 12th after it: the
+# watchdog's check retries every 5s, so a reload that keeps failing logs about once a minute, not on
+# every poll. The count is written with printf, not `: > file`: a failed redirection on a special
+# built-in terminates the script in dash and BusyBox ash, and the moment this writes is one when
+# /tmp may be full. A count that cannot be read back (absent, truncated by a full /tmp, not a plain
+# number of up to six digits, which also keeps a leading zero away from shell arithmetic) counts as
+# 1, so it is never reported again as a first failure on every poll. rc is the reload's own.
+_ks_reload() {
+    local n=""
+    if _fw_reload; then
+        if [ -f "$KS_RELOAD_FAIL" ]; then
+            read -r n 2>/dev/null < "$KS_RELOAD_FAIL"
+            case "$n" in ''|*[!0-9]*|0*|???????*) n="?" ;; esac
+            rm -f "$KS_RELOAD_FAIL"
+            logger -t ts-fix "ks: firewall reload succeeded after $n failed attempt(s) - the committed kill-switch config is in force again"
+        fi
+        return 0
+    fi
+    n=0
+    if [ -f "$KS_RELOAD_FAIL" ]; then
+        read -r n 2>/dev/null < "$KS_RELOAD_FAIL"
+        case "$n" in ''|*[!0-9]*|0*|???????*) n=1 ;; esac
+    fi
+    n=$((n + 1))
+    printf '%s\n' "$n" 2>/dev/null > "$KS_RELOAD_FAIL"
+    [ $(( (n - 1) % 12 )) = "0" ] && \
+        logger -t ts-fix "ks: ERROR firewall reload failed ($n in a row) - the committed kill-switch config is NOT in force until a reload succeeds; retrying on the next check"
+    return 1
+}
+
 # Commit both packages and reload. rc 1 if either commit failed, with an ERROR that says plainly
 # the kill switch is not effective — a caller must never log "armed" off the back of this.
 # The reload is attempted either way: if a staged change can still be made effective in memory
-# that is the safe direction, and the ERROR here is about durability, not about the reload.
+# that is the safe direction, and the ERROR here is about durability. A reload that fails is rc 1
+# too, with _ks_reload's own ERROR and its flag, which makes every later pass retry it.
 #   $1: "noreload" to commit without the reload. That is preboot's case: it runs before the
 #       firewall service has started, that start reads the committed config, and no reload may
 #       come first. A failed commit is handled exactly as it is with the reload.
 _ks_commit() {
-    local rc=0
+    local rc=0 rl=0
     uci commit firewall || rc=1
     uci commit ts-fix || rc=1
-    [ "$1" = "noreload" ] || _fw_reload
+    [ "$1" = "noreload" ] || _ks_reload || rl=1
     if [ "$rc" = "0" ]; then
         rm -f "$KS_COMMIT_FAIL"
-        return 0
+        return $rl
     fi
     # touch, not `: > file`: a failed redirection on a special built-in terminates the whole
     # script in dash and in BusyBox ash (verified in both), and the one moment this flag is
@@ -675,6 +788,9 @@ _ks_invariant() {
 # them: an upgrading v1.0.22 router carries live 5279 rules and the table-100 route, and the build
 # that installed them may not have refused the mode this one does.
 #
+# An intent that cannot be read is neither: one ERROR, rc 1, and nothing armed, written or removed.
+# Removing the rule layer there would turn a failed read into a disarm.
+#
 # Every other path asserts the rule layer, whatever became of the zone layer:
 #   - success, including a re-arm that changed and committed nothing: netifd may have wiped the
 #     rules since the last pass, and a zone layer in place says nothing about them. Only once 5279
@@ -682,14 +798,21 @@ _ks_invariant() {
 #     at 5280 (the layout before v1.0.21) removed, so an upgrading install is never without a rule
 #     layer in between. A swap that fails therefore keeps any 5280 rules until a later clean arm,
 #     which is harmless: they are the same rules at a different priority and block the same way.
-#   - failure, the zone state could not be read, written or committed: the rule layer is ensured
-#     anyway, since more protection is strictly better, and any 5280 rules are kept.
+#   - failure, the zone state could not be read, written or committed, or the reload that puts it
+#     in force failed (now or on an earlier pass, which this arm retries): the rule layer is
+#     ensured anyway, since more protection is strictly better, and any 5280 rules are kept.
 ks_arm() {
-    local rc=0 fam
+    local rc=0 fam irc
     _ks_changed=0
     _ks_wrfail=0
-    if ! _ks_intent; then
-        logger -t ts-fix "ks: arm called with no armed intent (kill_switch='$(uci -q get ts-fix.settings.kill_switch)' tailscale enabled='$(uci -q get tailscale.settings.enabled)') - nothing done"
+    _ks_intent
+    irc=$?
+    if [ "$irc" = "2" ]; then
+        logger -t ts-fix "ks: ERROR arm: $_ks_unread could not be read - nothing armed and nothing removed; the watchdog's check retries"
+        return 1
+    fi
+    if [ "$irc" = "1" ]; then
+        logger -t ts-fix "ks: arm called with no armed intent (kill_switch=${_ks_intent_ks:-(absent)} tailscale enabled=${_ks_intent_en:-(absent)}) - nothing done"
         _ks_rules_remove
         return 0
     fi
@@ -716,6 +839,8 @@ ks_arm() {
         else
             rc=1
         fi
+    elif [ -f "$KS_RELOAD_FAIL" ]; then
+        _ks_reload || rc=1
     fi
     if [ "$rc" = "0" ]; then
         if _ks_rules_ensure; then
@@ -739,15 +864,40 @@ ks_arm() {
 # disarm — take the rule layer down, then restore exactly what we severed, drop the sidecar, and
 # remove our lan -> tailscale0 forwarding only if we were the ones who created it. A forwarding
 # that is already enabled, or that carries no enabled option at all (uci's absent-means-enabled),
-# is left alone so a disarm with nothing to do stays free of commits and reloads.
+# is left alone so a disarm with nothing to do stays free of commits and reloads — except the
+# reload alone, retried while an earlier one is recorded as failed (KS_RELOAD_FAIL).
 #
 # The rule layer goes FIRST, before any forwarding is restored. A disarm interrupted after that
 # leaves the zone severed with its record intact, which check's lost-disarm backstop finishes; the
 # opposite order could leave a restored zone and no record, with the rules still blocking the LAN.
 # The sidecar is dropped only once every restore has actually landed: losing the record while a
 # forwarding is still disabled would strand it with no way back.
+#
+# Two stock GL features disable some of the very forwardings the zone layer severs, and can do so
+# while the kill switch is armed. Restoring such a section would silently undo the feature, so the
+# restore leaves it disabled, with one log line naming it, its pair and the reason:
+#   - GL Tor. While tor.global.enable is exactly '1', GL keeps the first forwarding section of the
+#     firewall config disabled (uci's @forwarding[0], lan -> wan on stock configs), so LAN traffic
+#     leaves only through Tor's transparent proxy. 4.8.4 and 4.9.0 do the same to
+#     firewall.guestzone_fwd and 4.11 does not, so that section counts only where the installed Tor
+#     script (KS_TOR_SCRIPT) names it; a missing script names nothing. uci resolves @forwarding[0]
+#     to the first forwarding-type section in file order, named or anonymous, and `uci show` prints
+#     the sections in that same order, whether it prints that one as @forwarding[0], by its raw
+#     cfgXXXXXX name or by its real name. So it is the first entry of $_ks_fwd, and no second,
+#     positional uci query is made that could disagree with the enumeration.
+#   - GL 4.11's per-network "block all WAN" (wan_access_mode 2). GL disables every forwarding from
+#     <net> to the zones named exactly wan and wan6, and records the mode as
+#     gl-black_white_list.<net>_transfer_enable.transfer_enable='0'. That key is what GL's own
+#     readback tests, and the same readback never puts lan in that mode. The older
+#     gl-black_white_list.<net>.transfer_enable is NOT it: it reads '0' on routers whose guest and
+#     iot are online, and keying on it would leave them offline after every disarm.
+# A section left disabled this way is not a failed restore: GL owns it now, so it does not keep the
+# sidecar alive. The cost is one uci read per disarm that has a record to restore, one grep only
+# while Tor is on, and one uci read per section from a network other than lan into wan or wan6
+# that would otherwise be written.
 ks_disarm() {
-    local sev sec src dest en rc=0
+    local sev sec src dest en why tor_fwd="" tor_gz="" rc=0 nl='
+'
     _ks_changed=0
     _ks_wrfail=0
     _ks_rules_remove
@@ -757,6 +907,12 @@ ks_disarm() {
             logger -t ts-fix "ks: ERROR no firewall forwarding sections could be enumerated - keeping the restore record ($sev) so a later disarm can still use it"
             return 1
         fi
+        # The sections GL's Tor manages. Both names stay empty while Tor is off, and an empty name
+        # matches no section.
+        if [ "$(uci -q get tor.global.enable)" = "1" ]; then
+            tor_fwd="${_ks_fwd%%"$nl"*}"
+            grep -q guestzone_fwd "$KS_TOR_SCRIPT" 2>/dev/null && tor_gz=firewall.guestzone_fwd
+        fi
         for sec in $_ks_fwd; do
             src=$(uci -q get "$sec.src")
             dest=$(uci -q get "$sec.dest")
@@ -764,6 +920,22 @@ ks_disarm() {
             en=$(uci -q get "$sec.enabled")
             [ "$en" = "1" ] && continue
             [ -z "$en" ] && continue
+            why=""
+            case "$sec" in
+                "$tor_fwd"|"$tor_gz") why="GL Tor is on and manages it" ;;
+            esac
+            if [ -z "$why" ] && [ "$src" != "lan" ]; then
+                case "$dest" in
+                    wan|wan6)
+                        [ "$(uci -q get "gl-black_white_list.${src}_transfer_enable.transfer_enable")" = "0" ] && \
+                            why="GL blocks internet access for $src"
+                        ;;
+                esac
+            fi
+            if [ -n "$why" ]; then
+                logger -t ts-fix "ks: disarm left $sec ($src:$dest) disabled - $why"
+                continue
+            fi
             _ks_set "$sec.enabled=1" "$src:$dest stays severed" || continue
             _ks_changed=1
         done
@@ -782,11 +954,15 @@ ks_disarm() {
     [ "$_ks_wrfail" = "1" ] && rc=1
     if [ "$_ks_changed" = "1" ] || [ -f "$KS_COMMIT_FAIL" ]; then
         if _ks_commit; then
+            # A forwarding left disabled for GL, or one whose write failed, has a line of its own
+            # above this one, so "unless named above" keeps this line true in every case.
             [ "$_ks_changed" = "1" ] && \
-                logger -t ts-fix "ks: disarmed - restored pairs: $sev"
+                logger -t ts-fix "ks: disarmed - recorded pairs: ${sev:-none}; every forwarding of theirs is now enabled unless named above"
         else
             rc=1
         fi
+    elif [ -f "$KS_RELOAD_FAIL" ]; then
+        _ks_reload || rc=1
     fi
     return $rc
 }
@@ -809,30 +985,47 @@ ks_disarm() {
 #     not ours costs the tests and is left alone, silently.
 #
 # Both run in EVERY mode on purpose: taking the kill switch down is always safe, and a router that
-# was armed and has since been put into a bridged mode must still be able to recover.
+# was armed and has since been put into a bridged mode must still be able to recover. So does the
+# retry of a firewall reload recorded as failed (KS_RELOAD_FAIL), which is the reload alone: a
+# restore committed by a disarm is not in force until it succeeds either.
 #
 # While armed: re-sever anything the firewall re-emitted or anything new that qualifies, keep the
 # tunnel path present, run the runtime invariant, then assert the rule layer. Commits and reloads
 # happen only when something actually changed, or when a previous commit failed and still needs
-# retrying; a rule layer already in place, swap included, costs six `ip` reads and one ipcalc per
-# guest/iot bridge that has an address, and nothing more.
+# retrying; a previous reload that failed is retried on its own, with no commit. A rule layer
+# already in place, swap included, costs six `ip` reads and one ipcalc per guest/iot bridge that
+# has an address, and nothing more.
+#
+# An intent that cannot be read (_ks_intent rc 2) is neither branch: check holds, rc 1, and changes
+# nothing at all — not even the disarmed branch's cleanups, which take protection down too. One
+# WARNING per episode (_ks_intent_hold), and one line when the intent reads again (_ks_intent_ok).
 ks_check() {
-    local rc=0 list br
-    if ! _ks_intent; then
+    local rc=0 list br irc
+    _ks_intent
+    irc=$?
+    if [ "$irc" = "2" ]; then
+        _ks_intent_hold
+        return 1
+    fi
+    _ks_intent_ok
+    if [ "$irc" = "1" ]; then
         if [ -n "$(_sev_list)" ]; then
             logger -t ts-fix "ks: severed forwardings recorded with no armed intent - a disarm was lost; disarming now"
             ks_disarm
             return $?
+        fi
+        if [ -f "$KS_RELOAD_FAIL" ]; then
+            _ks_reload || rc=1
         fi
         list=$(ip -4 rule list priority "$KS_RULE_PRIO" 2>/dev/null)
         for br in $KS_RULE_IIFS; do
             _ks_rule_ours "$list" "$br" || continue
             _ks_rules_remove
             logger -t ts-fix "ks: rule layer found with no armed intent - removed"
-            return 0
+            return $rc
         done
         _ks_swap_mark_ours && _ks_swap_restore stale
-        return 0
+        return $rc
     fi
     # The mode gate applies to the armed branch too, and must be here rather than only in arm:
     # postinst restarts the service — which runs a check — BEFORE it calls arm, so without this a
@@ -854,6 +1047,8 @@ ks_check() {
     [ "$_ks_wrfail" = "1" ] && rc=1
     if [ "$_ks_changed" = "1" ] || [ -f "$KS_COMMIT_FAIL" ]; then
         _ks_commit || rc=1
+    elif [ -f "$KS_RELOAD_FAIL" ]; then
+        _ks_reload || rc=1
     fi
     _ks_rules_ensure || rc=1
     _ks_scope_warn
@@ -872,17 +1067,24 @@ ks_check() {
 # it. No ip, ubus, jsonfilter or tailscale call, no runtime invariant, no scope scan, no rule layer
 # (netifd's start, which comes later, would wipe it), and nothing that waits. It gates on intent
 # and mode as arm does, but both refusals are silent no-ops with rc 0: a boot script has nobody to
-# tell, and a sidecar stranded with the kill switch off is check's to unwind. An unreadable
-# firewall config is one ERROR line and rc 1, with nothing written. When pairs were severed, one
-# line names them.
+# tell, and a sidecar stranded with the kill switch off is check's to unwind. An intent that cannot
+# be read, or an unreadable firewall config, is one ERROR line and rc 1, with nothing written. When
+# pairs were severed, one line names them. A reload failure recorded earlier is not retried here
+# (no reload may come before the firewall start); the next check retries it.
 #
 # Boot only: on a live router the committed severing would not reach netfilter, and the next check
 # would find nothing left to change in UCI and so reload nothing. So ks_main refuses preboot with
 # rc 2, before any lock, uci or ip call, unless TS_FIX_KS_BOOT=1 is in its environment — and only
 # /etc/init.d/ts-fix-preboot's boot() passes that; its start() never runs the pass.
 ks_preboot() {
-    local rc=0 msg=""
-    _ks_intent || return 0
+    local rc=0 msg="" irc
+    _ks_intent
+    irc=$?
+    if [ "$irc" = "2" ]; then
+        logger -t ts-fix "ks: ERROR preboot: $_ks_unread could not be read - nothing was re-severed before the firewall start and no config was written"
+        return 1
+    fi
+    [ "$irc" = "0" ] || return 0
     _ks_mode_refused && return 0
     _ks_changed=0
     _ks_wrfail=0
@@ -1232,24 +1434,33 @@ _ks_swap_mark_write() {
 # ipcalc; GL's "from <net> lookup main" deleted if it is there; "to <net> lookup main priority 0"
 # ensured. IPv4 only: GL builds its rule from the interface's ipv4-address, and guest/iot IPv6
 # already reaches the v6 5279 rules. Exactly one `ip -4 -br addr` and one `ip -4 rule list
-# priority 0` per call, both before any write; either failing is an ERROR and rc 1 with nothing
-# written. A zone whose network cannot be derived is an ERROR and rc 1 with no write for that zone,
-# and the other zone still gets its swap.
+# priority 0` per call before any write (the read-backs below come only after one); either failing
+# is an ERROR and rc 1 with nothing written. A zone whose network cannot be derived is an ERROR and
+# rc 1 with no write for that zone, and the other zone still gets its swap.
 #
-# A write that fails is read back once, as _ks_rules_ensure reads back its adds: the lock-free
+# GL's rule is deleted until a fresh `ip -4 rule list priority 0` no longer shows it, at most 5
+# times, each delete followed by that one read: a delete that names no input device removes the
+# FIRST rule in list order matching what it does name (kernel 5.4, iproute2 6.3.0), so a foreign
+# "from <net> iif <dev> lookup main" listed ahead of GL's rule is the one a single delete takes.
+# Only a read-back without GL's rule counts as "deleted", and only when one of this pass's deletes
+# succeeded — one that found nothing means a concurrent pass took it, which is no failure either.
+# A rule still listed after the 5th delete, or a read-back that fails, is an ERROR and rc 1.
+#
+# An add that fails is read back once, as _ks_rules_ensure reads back its adds: the lock-free
 # rules-ensure (hotplug) and the locked passes can run together, and Route Guest's code in reapply
-# and the RPC deletes and re-adds these same rules. So if any delete or add in a pass fails, ONE
-# more rule list is taken, and only a delete whose rule is still there, or an add whose rule is
-# still missing, is an ERROR and rc 1.
+# and the RPC deletes and re-adds these same rules. So if an add in a pass fails, ONE more rule list
+# is taken, and only an add whose rule is still missing is an ERROR and rc 1.
 #
 # Then the marker: the union of the valid lines already in it and this pass's "<zone> <net>" lines,
 # the existing ones first, so a network that changes or goes away while armed stays recorded until
 # the undo cleans it. It is rewritten only when that differs from what the file holds (see
 # _ks_swap_mark_write for how). A pass with everything in place therefore costs the two reads and
-# one ipcalc per guest/iot bridge that has an address: no write, no marker rewrite, no log. One
-# line reports what was deleted or added, when something was.
+# one ipcalc per guest/iot bridge that has an address: no write, no marker rewrite, no log; the
+# read-backs above happen only after a delete. One line reports what was deleted or added, when
+# something was.
 _ks_swap_ensure() {
-    local addrs list zb zone br net ent entries="" what did="" miss="" failed="" m rest new rc=0 nl='
+    local addrs list l2 zb zone br net ent entries="" what did="" miss="" failed="" m new n hit gone \
+        rc=0 nl='
 '
     if ! addrs=$(ip -4 -br addr 2>/dev/null); then
         logger -t ts-fix "ks: ERROR source-rule swap: 'ip -4 -br addr' failed - nothing was checked, so GL's guest/iot source rule, if present, still routes around priority $KS_RULE_PRIO"
@@ -1273,17 +1484,35 @@ _ks_swap_ensure() {
         entries="$entries $zone:$net"
         what=""
         if _ks_src_rule "$list" gl "$net"; then
-            if ip -4 rule del priority 0 from "$net" lookup main 2>/dev/null; then
-                what="deleted GL's from-rule"
-            else
-                miss="$miss gl:$zone:$net"
-            fi
+            # Taking a foreign rule of the same source and table at priority 0 on the way is
+            # accepted by design: removing GL's bypass of priority 5279 outranks preserving it.
+            n=0
+            hit=0
+            gone=""
+            while [ "$n" -lt 5 ]; do
+                n=$((n + 1))
+                ip -4 rule del priority 0 from "$net" lookup main 2>/dev/null && hit=1
+                if ! l2=$(ip -4 rule list priority 0 2>/dev/null); then
+                    gone=unread
+                    break
+                fi
+                list="$l2"
+                if ! _ks_src_rule "$list" gl "$net"; then
+                    gone=yes
+                    break
+                fi
+            done
+            case "$gone" in
+                yes)    [ "$hit" = "1" ] && what="deleted GL's from-rule" ;;
+                unread) failed="${failed:+$failed; }GL's from-rule for $zone $net could not be confirmed gone" ;;
+                *)      failed="${failed:+$failed; }GL's from-rule for $zone $net is still present after $n deletes" ;;
+            esac
         fi
         if ! _ks_src_rule "$list" ours "$net"; then
             if ip -4 rule add to "$net" lookup main priority 0 2>/dev/null; then
                 what="${what:+$what, }added the to-rule"
             else
-                miss="$miss ours:$zone:$net"
+                miss="$miss $zone:$net"
             fi
         fi
         [ -n "$what" ] && did="${did:+$did, }$zone $net ($what)"
@@ -1291,16 +1520,9 @@ _ks_swap_ensure() {
     if [ -n "$miss" ]; then
         list=$(ip -4 rule list priority 0 2>/dev/null) || list="-"
         for m in $miss; do
-            rest="${m#*:}"
-            zone="${rest%%:*}"
-            net="${rest#*:}"
-            if [ "${m%%:*}" = "gl" ]; then
-                if [ "$list" = "-" ]; then
-                    failed="${failed:+$failed; }GL's from-rule for $zone $net could not be confirmed gone"
-                elif _ks_src_rule "$list" gl "$net"; then
-                    failed="${failed:+$failed; }GL's from-rule for $zone $net is still present"
-                fi
-            elif [ "$list" = "-" ]; then
+            zone="${m%%:*}"
+            net="${m#*:}"
+            if [ "$list" = "-" ]; then
                 failed="${failed:+$failed; }the to-rule for $zone $net could not be confirmed"
             elif ! _ks_src_rule "$list" ours "$net"; then
                 failed="${failed:+$failed; }the to-rule for $zone $net is still absent"
@@ -1372,14 +1594,18 @@ _ks_swap_brnet() {
 #     summary line gives how many did. A bridge whose address yields no valid network might be that
 #     bridge, so an entry is kept on its account too, after one ERROR naming the bridge. If the
 #     address read itself fails, no entry can be checked and no to-rule is deleted: one ERROR;
-#   - GL's rule is re-added only where GL would have it now: tailscale.settings.exit_node_ip
-#     non-empty, and network.<zone>.disabled exactly '0' (an absent option does not qualify, as in
-#     gl_tailscale). Its network is the zone bridge's CURRENT one, never a network from the marker,
-#     which may be stale, taken from that same address read. Each bridge's network is derived once
-#     per undo (_ks_swap_brnet), so an undo costs one `ip -4 -br addr` and at most one ipcalc per
-#     addressed bridge in all. It is added only if the one rule list taken for this step does not
-#     show it already, and a failed add is read back once, as in _ks_swap_ensure; only a rule still
-#     missing after that is an ERROR.
+#   - GL's rule is re-added only where GL would have it now: tailscale.settings.enabled exactly '1',
+#     glconfig.general.mode exactly 'router', tailscale.settings.exit_node_ip non-empty, and
+#     network.<zone>.disabled exactly '0' (an absent option never qualifies, as in gl_tailscale).
+#     GL deletes the rules it tracks on every restart and adds them back only on its enabled,
+#     router-mode path, so a copy re-added while Tailscale is off is tracked by nothing, and at
+#     priority 0 it outranks the slider accessory's transition lockdown on the next turn-on. Its
+#     network is the zone bridge's CURRENT one, never a network from the marker, which may be stale,
+#     taken from that same address read. Each bridge's network is derived once per undo
+#     (_ks_swap_brnet), so an undo costs one `ip -4 -br addr` and at most one ipcalc per addressed
+#     bridge in all. It is added only if the one rule list taken for this step does not show it
+#     already, and a failed add is read back once, as in _ks_swap_ensure; only a rule still missing
+#     after that is an ERROR.
 # The marker is removed at the end whatever happened. A to-rule left behind is benign, since it is
 # what Route Guest installs permanently, and a GL rule that was not re-added is fail-closed: GL adds
 # it again on its next restart. rc 1 when an ERROR was logged. One line reports what changed, and
@@ -1442,7 +1668,9 @@ _ks_swap_restore() {
         done
         [ "$hit" = "1" ] && removed="${removed:+$removed, }$zone $net"
     done
-    if [ -n "$re" ] && [ -n "$(uci -q get tailscale.settings.exit_node_ip)" ]; then
+    if [ -n "$re" ] && [ "$(uci -q get tailscale.settings.enabled)" = "1" ] && \
+       [ "$(uci -q get glconfig.general.mode)" = "router" ] && \
+       [ -n "$(uci -q get tailscale.settings.exit_node_ip)" ]; then
         for zone in $re; do
             [ "$(uci -q get "network.$zone.disabled")" = "0" ] && cand="${cand:+$cand }$zone"
         done
@@ -1516,9 +1744,15 @@ _ks_swap_restore() {
 # rules-ensure — assert the rule layer alone, the source-rule swap included, for a caller that must
 # neither touch the zone layer nor wait for the engine lock (ks_main says why it takes none). Gated
 # on the same intent and mode as arm and check: with either against it, rc 0 and not a single ip
-# call.
+# call. An intent that cannot be read holds the same way, with no ip call, but rc 1 (the rule layer
+# is not known to be right) and silently: this runs from hotplug and reapply, whose callers discard
+# the rc, and the watchdog's check owns the WARNING.
 ks_rules_ensure() {
-    _ks_intent || return 0
+    _ks_intent
+    case $? in
+        1) return 0 ;;
+        2) return 1 ;;
+    esac
     _ks_mode_refused && return 0
     _ks_rules_ensure
 }

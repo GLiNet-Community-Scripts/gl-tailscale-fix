@@ -83,6 +83,12 @@ tests/
     test-postinst-config.sh  postinst's config restore
     test-awk-busybox.sh      the BusyBox 1.33.2 awk trap, over every file whose awk runs on a router
     test-prerm-drain-probes.sh  prerm-drain's probes: an unreachable router never scores clean
+    test-wd-masq.sh          the watchdog's tailscale0 masquerade repair
+    test-wd-guest.sh         the watchdog's Route Guest enforcement and IPv6 isolate backstop
+    test-keep-binary.sh      keeping a Version Manager Tailscale binary across firmware upgrades
+    test-acc-switch.sh       the side-switch accessory, accessories/gl-switch.d/tailscale.sh
+    test-isolate6.sh         ts-fix-isolate6, its hotplug, and the postrm/packaging around it
+    test-ts-state.sh         the shared fail-secure Tailscale-state read, in four scripts
 ```
 
 ## Unit suites (laptop only, no router)
@@ -97,6 +103,12 @@ tests/
 | `test-postinst-config.sh` | The config-restore block in `pkg/postinst`, run against a throwaway fake root after its paths are rewritten and the rewrite is linted: the live config wins over prerm's saved copy, the saved copy is used only when the live file is gone, and the default only when both are. Takes another postinst as its argument, for a run against an older one |
 | `test-awk-busybox.sh` | The BusyBox 1.33.2 awk trap — `name (expr)` read as a call to a function `name` when the line runs: `lib/awk-busybox-lint.py` on the fixtures in `unit/fixtures/awk-busybox/` in both directions, then over every repo file whose awk runs on a router, with a canary line proving each awk program was read to its end. `--files F...` lints the files given instead. Needs `python3` |
 | `test-prerm-drain-probes.sh` | The probe helpers of `prerm-drain.sh`, taken out by name and run by `bash` with a fake `rssh`: with an unreachable router the residue enumeration is `RES PROBE-ERROR` lines and its count FAILs, and the sidecar, `ts_fix_lan2ts` and pair-restore reads come back `probe-dead` / `unread` rather than empty; with a router that answers, a clean one PASSes and a leftover file FAILs with its line logged. Needs `bash` |
+| `test-wd-masq.sh` | The watchdog's tailscale0 masquerade repair (`ensure_ts0_masq`), its copy of `is_fw49_plus`, the library guard (`TS_FIX_WD_LIB=1`), where the poll loop calls the repair, and its log text. Takes another watchdog as its argument, for a run against an older one |
+| `test-wd-guest.sh` | The watchdog's Route Guest enforcement (`ensure_route_guest_swap`: GL's priority-0 `from <guest net> lookup main` replaced by `to <guest net> lookup main` when Route Guest is on, quiet polls write nothing) and its every-sixth-poll `ts-fix-isolate6 sync` backstop (`iso6_backstop`), with `uci`, `ip`, `logger` and `ipcalc` faked. Takes another watchdog as its argument; the version before Route Guest enforcement fails it |
+| `test-keep-binary.sh` | Keeping a Version Manager Tailscale binary across a firmware upgrade: the static keep list no longer names the binaries, `ts-fix-update` writes and removes `/lib/upgrade/keep.d/gl-tailscale-fix-tailscale` on install, restore and `--sync-keep`, and `pkg/postinst` / `pkg/postrm` around it |
+| `test-acc-switch.sh` | The side-switch accessory, `accessories/gl-switch.d/tailscale.sh`, in library mode with GL's RPC, `uci`, `ip` and the kill-switch engine faked: the ON path (lockdown, arm before GL's restart, exit node, lockdown removal) and the OFF path |
+| `test-isolate6.sh` | `src/scripts/ts-fix-isolate6`, the IPv6 half of GL's "Block WAN Subnets": its parsers over `uci show` and `ip -6 route` text, `sync` against a fake `uci` / `ubus` / `ip` / `flock` / firewall (create, update, remove, idempotence, the whole-rule comparison, read-back before commit, commit and reload retries, read failure kept apart from absence, invalid names and prefixes never reaching uci), `remove`, the `98-ts-fix-isolate6` hotplug, the `pkg/postrm` block, and the packaging lines. Takes another tree root as its argument; the tree without the script fails it |
+| `test-ts-state.sh` | The fail-secure Tailscale-state read (a failed read of the plugin's own or GL's Tailscale settings must not be taken as "turned off"): the shared read helper is byte-identical in `ts-fix-watchdog`, `ts-fix-reapply`, the `20-ts-fix` hotplug and `pkg/postinst`, and agrees with the engine on every read combination; also that the watchdog runs one poll at a time. 155 checks; 72 of them fail against the RC8 sources |
 
 Run each suite from the repository root under both shells, for example:
 

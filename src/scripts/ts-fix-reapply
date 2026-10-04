@@ -175,14 +175,83 @@ route_list_drop() {
 }
 # ---8<--- end guest_net ---8<---
 
-enabled=$(uci -q get tailscale.settings.enabled)
+# ---8<--- ts_state
+# The kill switch's intent, read as the engine reads it (_ks_intent in /usr/bin/ts-fix-ks). This
+# block is byte-identical in ts-fix-watchdog, ts-fix-reapply, hotplug 20-ts-fix and postinst;
+# tests/unit/test-ts-state.sh holds the copies to that, and to the engine's meaning.
+#
+# `uci -q get` prints nothing and returns 1 both for an absent option and for a read that failed,
+# so it cannot tell "off" from "unknown", and a failed read taken for "off" tears protection down.
+# `uci -q show <pkg>.settings` can: a readable section prints its own "<pkg>.settings=<type>" line
+# first, and a failed read prints nothing. An option absent from a readable section is off (GL's
+# slider accessory deletes tailscale.settings.enabled to restore its never-set state); a failed read
+# is UNKNOWN, and no caller may act on it as off. Shell matching only: no fork beyond the uci call.
+#
+# ts_state — tailscale.settings, read once: ts_en is 1 when it holds enabled='1', 0 for any other
+# value or none, and EMPTY when the read failed (rc 1); ts_eip is exit_node_ip's value, empty when
+# absent, and means something only when ts_en is not empty. uci prints the value single-quoted, and
+# an address holds no quote of its own, so the outer pair is all there is to strip.
+ts_state() {
+    local out nl='
+'
+    ts_en=""
+    ts_eip=""
+    out=$(uci -q show tailscale.settings 2>/dev/null)
+    case "$out" in
+        "tailscale.settings="*) ;;
+        *) return 1 ;;
+    esac
+    ts_en=0
+    case "$out$nl" in
+        *"${nl}tailscale.settings.enabled='1'$nl"*) ts_en=1 ;;
+    esac
+    case "$out" in
+        *"${nl}tailscale.settings.exit_node_ip="*)
+            ts_eip=${out#*"${nl}tailscale.settings.exit_node_ip="}
+            ts_eip=${ts_eip%%"$nl"*}
+            ts_eip=${ts_eip#\'}
+            ts_eip=${ts_eip%\'}
+            ;;
+    esac
+    return 0
+}
 
-# If Tailscale is disabled, tear down all ts-fix state and exit.
+# ks_state — ts-fix.settings, read once: ks_on is 1 when it holds kill_switch='1', 0 for any other
+# value or none, and EMPTY when the read failed (rc 1).
+ks_state() {
+    local out nl='
+'
+    ks_on=""
+    out=$(uci -q show ts-fix.settings 2>/dev/null)
+    case "$out" in
+        "ts-fix.settings="*) ;;
+        *) return 1 ;;
+    esac
+    ks_on=0
+    case "$out$nl" in
+        *"${nl}ts-fix.settings.kill_switch='1'$nl"*) ks_on=1 ;;
+    esac
+    return 0
+}
+# ---8<--- end ts_state
+
+# One read of tailscale.settings (ts_state, above). A read that failed is UNKNOWN, never "disabled":
+# taken for a disable it used to run the teardown below, which commits kill_switch=0 — a failed read
+# turned into a durable disarm. Nothing is done on it, and rc 1 says so; the watchdog's next poll
+# runs this again.
+ts_state
+if [ -z "$ts_en" ]; then
+    logger -t ts-fix "ERROR reapply: tailscale.settings could not be read - nothing done (no teardown, no re-apply); the watchdog retries"
+    exit 1
+fi
+
+# If Tailscale is disabled — enabled '0', or the option absent, as GL's slider leaves it — tear
+# down all ts-fix state and exit.
 # This covers the case where a user disables Tailscale while our switches
 # are active — the kill switch, firewall forwardings, and policy routes must
 # be cleaned up, and UCI settings reset to 0 so everything starts clean
 # when Tailscale is re-enabled.
-if [ "$enabled" != "1" ]; then
+if [ "$ts_en" = "0" ]; then
     # Hand the kill switch back to its engine: it re-enables exactly the forwardings we severed and
     # clears any RPDB-era rules an older install left behind. A failure here leaves LAN/guest/IoT
     # egress severed, so say so loudly — the UCI reset below must not read as "all clean".
@@ -288,16 +357,23 @@ flock -n 200 || exit 0
 # install nor a flush-reactive guard is needed (the engine's header has the detail).
 #
 # Design C is unchanged: armed iff the user's kill_switch intent is on AND Tailscale is enabled
-# (the enabled!=1 teardown above handles a user disable). Nothing reads exit-node state, so the
-# daemon's transient or stale ExitNodeID can neither arm nor disarm it — fail-secure: block, never
-# leak the real IP. Only a kill_switch=0 toggle or a Tailscale disable takes it down.
+# (the teardown above handles a user disable). Nothing reads exit-node state, so the daemon's
+# transient or stale ExitNodeID can neither arm nor disarm it — fail-secure: block, never leak the
+# real IP. Only a kill_switch=0 toggle or a Tailscale disable takes it down.
+#
+# kill_switch is read the three-state way (ks_state, above). A read that failed is neither arm nor
+# disarm: one ERROR, and the kill switch is left exactly as it is — the engine's own check, on the
+# watchdog's next poll, reads intent itself and is the authority. Taking it for "off" used to
+# disarm an armed router.
 #
 # Established flows are carried by masq/masq6 rather than by anything here: on interface death
 # masquerade's device-down handler purges its conntrack entries, and on exit-node clear tailscaled's
 # own config-change cleanup purges them (device-measured on fw3 2026-08-17; fw4 re-proof is a ship
 # gate). Applied HERE, before the daemon waits below, because arming needs no daemon state at all.
-kill_switch=$(uci -q get ts-fix.settings.kill_switch)
-if [ "$kill_switch" = "1" ]; then
+ks_state
+if [ -z "$ks_on" ]; then
+    logger -t ts-fix "ERROR reapply: ts-fix.settings could not be read - kill switch left as it is (neither armed nor disarmed); the engine's check is the authority"
+elif [ "$ks_on" = "1" ]; then
     # Neither a mode refusal (rc 2) nor an engine failure (rc 1) may abort this script: the
     # domain, masquerade, exit-node and guest work below is independent of the kill switch and
     # still has to run. The engine has already logged its own reason in both cases; these lines
@@ -487,10 +563,19 @@ fi
 # the configured exit node, the state it wants either way (a no-op where the
 # daemon already has it), and a CLEAR is skipped; the watchdog's table-52 check
 # clears a daemon exit node that outlives GL's UCI whatever this read returned.
-gl_exit_ip=$(uci -q get tailscale.settings.exit_node_ip)
+#
+# exit_node_ip is read again here, not taken from the top of the script: GL's chain and the waits
+# above can last a minute and more, and the value may have changed. The read is the three-state
+# one (ts_state, above): one that failed would leave exit_node_ip empty, which reads as the user
+# clearing the exit node — a CLEAR pushed to the daemon, the snapshot moved — so on a failed read
+# the reconcile is skipped, with one line, and the snapshot option is left as it is.
+ts_state
+gl_exit_ip=$ts_eip
 ts_exit_id=$(timeout 10 /usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.ExitNodeID' 2>/dev/null)
 last_seen=$(uci -q get ts-fix.settings.last_seen_exit_node_ip)
-if [ "$gl_exit_ip" != "$last_seen" ]; then
+if [ -z "$ts_en" ]; then
+    logger -t ts-fix "reconcile: tailscale.settings could not be read - exit-node reconcile skipped, snapshot left at '${last_seen}'"
+elif [ "$gl_exit_ip" != "$last_seen" ]; then
     # exit_node_ip value changed since our last reapply. The binary version in
     # the log lines attributes future field reports (tiny builds are the known
     # buggy population); captured only when a reconcile actually fires.

@@ -51,6 +51,7 @@ install -m 644 "$ROOT_DIR/src/config/ts-fix" "$DATA/etc/config/ts-fix.default"
 install -d "$DATA/etc/hotplug.d/iface"
 install -m 755 "$ROOT_DIR/src/hotplug/20-ts-fix" "$DATA/etc/hotplug.d/iface/20-ts-fix"
 install -m 755 "$ROOT_DIR/src/hotplug/10-ts-fix-ks" "$DATA/etc/hotplug.d/iface/10-ts-fix-ks"
+install -m 755 "$ROOT_DIR/src/hotplug/98-ts-fix-isolate6" "$DATA/etc/hotplug.d/iface/98-ts-fix-isolate6"
 
 # Procd init script (UCI reload trigger)
 install -d "$DATA/etc/init.d"
@@ -79,6 +80,7 @@ install -m 755 "$ROOT_DIR/src/scripts/ts-fix-update" "$DATA/usr/bin/ts-fix-updat
 install -m 755 "$ROOT_DIR/src/scripts/ts-fix-reapply" "$DATA/usr/bin/ts-fix-reapply"
 install -m 755 "$ROOT_DIR/src/scripts/ts-fix-watchdog" "$DATA/usr/bin/ts-fix-watchdog"
 install -m 755 "$ROOT_DIR/src/scripts/ts-fix-ks" "$DATA/usr/bin/ts-fix-ks"
+install -m 755 "$ROOT_DIR/src/scripts/ts-fix-isolate6" "$DATA/usr/bin/ts-fix-isolate6"
 
 # Sysupgrade persistence
 install -d "$DATA/lib/upgrade/keep.d"

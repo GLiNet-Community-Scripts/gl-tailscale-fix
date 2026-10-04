@@ -92,17 +92,26 @@ _uci_del() {    # key — an option, or a section plus every option under it
     return $rc
 }
 
-_uci_show() {   # <pkg> — section lines with the type unquoted, option lines single-quoted
-    local k p v k2 p2 v2
+# <pkg> or <pkg>.<section> — section lines with the type unquoted, option lines single-quoted, as a
+# router prints them (device-verified 2026-10-04 on GL 4.8.4, 4.9.0 and 4.11.0:
+# "tailscale.settings=settings", then "tailscale.settings.enabled='1'"). A package or section with
+# nothing to print is rc 1 and prints nothing, as on the device.
+_uci_show() {
+    local k p v k2 p2 v2 rc=1
     while IFS='|' read -r k p v; do
         [ "$k" = "S" ] || continue
-        case "$p" in "$1".*) ;; *) continue ;; esac
+        case "$1" in
+            *.*) [ "$p" = "$1" ] || continue ;;
+            *)   case "$p" in "$1".*) ;; *) continue ;; esac ;;
+        esac
+        rc=0
         printf '%s=%s\n' "$p" "$v"
         while IFS='|' read -r k2 p2 v2; do
             [ "$k2" = "O" ] || continue
             case "$p2" in "$p".*) printf "%s='%s'\n" "$p2" "$v2" ;; esac
         done < "$STATE"
     done < "$STATE"
+    return $rc
 }
 
 uci() {
@@ -114,6 +123,14 @@ uci() {
     done
     cmd="$1"; shift
     arg="$1"
+    # Fault injection: UCI_READ_FAIL names packages (space separated) whose reads fail — a show or
+    # get of one prints nothing and returns 1, as a read of an unreadable config does. That is also
+    # exactly what a get of an ABSENT option does, which is why the engine reads intent with show.
+    case "$cmd" in
+        show|get)
+            case " $UCI_READ_FAIL " in *" ${arg%%.*} "*) return 1 ;; esac
+            ;;
+    esac
     case "$cmd" in
         show) _uci_show "$arg" ;;
         get)  _uci_get "$arg" ;;
@@ -158,11 +175,13 @@ uci() {
 #   R|<family>|<priority>|<iif>|<action>   a policy rule: R|-4|5279|br-lan|lookup 100, or GL's
 #                                          own kind, R|-4|5280|br-lan|blackhole
 #   U|<family>|<table>                     an "unreachable default" route in that table
-#   S|<family>|<priority>|<from>|<to>|<action>
+#   S|<family>|<priority>|<from>|<to>|<action>[|<iif>]
 #                                          a selector rule, "all" for a selector it does not have:
 #                                          GL's LAN and uplink rules and the swap's own
 #                                          (S|-4|0|all|192.168.50.0/24|lookup main), GL's guest/iot
-#                                          source rule (S|-4|0|192.168.160.0/24|all|lookup main)
+#                                          source rule (S|-4|0|192.168.160.0/24|all|lookup main);
+#                                          the optional seventh field is an input device, for a
+#                                          foreign rule such as "from <net> iif lo lookup main"
 # `rule add` and `route add` append, except that an add identical to a record already present is
 # refused as the kernel refuses it: rc 2, "RTNETLINK answers: File exists" on stderr, nothing
 # appended. `rule del` and `route del` remove exactly ONE exactly-matching record (rc 1 when there
@@ -178,6 +197,11 @@ uci() {
 # priority and table matches it that way, and a delete removes the FIRST such rule in list order —
 # so `del ... from X` also takes "from X to Y", and `add from X` collides with it. A delete that
 # finds nothing is rc 2 with "RTNETLINK answers: No such file or directory", as iproute2 prints it.
+# A record with an input device is taken by a delete that gives no device the same way: on kernel
+# 5.4 with iproute2 6.3.0 (device-verified 2026-10-04) a delete that omits a selector removes the
+# FIRST rule in list order matching the selectors it gives, so a foreign "from N iif lo lookup
+# main" listed before GL's "from N lookup main" is the one deleted. Whether an add collides with
+# such a record is not modelled: an add that meets one lands in $T/ip-unsupported, failing the run.
 # `rule list priority 0` prints the kernel's own "from all lookup local" first (it is not a record,
 # so nothing can delete it), then the records in insertion order. `ip -4 -br addr` prints lo, then
 # the IP4_BR_ADDR fixture lines verbatim (see br_line for their exact layout).
@@ -226,9 +250,9 @@ _ip_del() {         # <record> — remove exactly one exactly-matching record; r
 }
 
 _ip_rule_list() {   # <family> <priority>
-    local k f p x y z
+    local k f p x y z w sel
     [ "$2" = "0" ] && printf '0:\tfrom all lookup local\n'
-    while IFS='|' read -r k f p x y z; do
+    while IFS='|' read -r k f p x y z w; do
         if [ "$f" != "$1" ] || [ "$p" != "$2" ]; then continue; fi
         case "$k" in
             R)
@@ -238,11 +262,10 @@ _ip_rule_list() {   # <family> <priority>
                 esac
                 ;;
             S)
-                if [ "$y" = "all" ]; then
-                    printf '%s:\tfrom %s %s\n' "$p" "$x" "$z"
-                else
-                    printf '%s:\tfrom %s to %s %s\n' "$p" "$x" "$y" "$z"
-                fi
+                sel="from $x"
+                [ "$y" = "all" ] || sel="$sel to $y"
+                [ -n "$w" ] && sel="$sel iif $w"
+                printf '%s:\t%s %s\n' "$p" "$sel" "$z"
                 ;;
         esac
     done < "$IPSTATE"
@@ -264,6 +287,7 @@ _ip_smatch() {
                { [ "$dst" = "all" ] || [ "$5" = "$dst" ]; }; then
                 hit=0
                 [ "$del" = "del" ] && continue
+                [ -n "$7" ] && printf 'add meeting an iif rule: %s\n' "$r" >> "$T/ip-unsupported"
             fi
         fi
         printf '%s\n' "$r" >> "$IPSTATE.m"
@@ -519,17 +543,26 @@ if ! command -v ks_main >/dev/null 2>&1; then
     echo "FAIL: $SRC did not define ks_main (dispatcher missing, or the TS_FIX_KS_NO_MAIN guard changed)"
     exit 1
 fi
-# /etc/init.d/firewall cannot be a shell function, so replace the engine's wrapper instead.
-_fw_reload() { printf 'reload\n' >> "$T/reloads"; printf 'reload\n' >> "$T/seq"; }
+# /etc/init.d/firewall cannot be a shell function, so replace the engine's wrapper instead. Every
+# attempt is recorded; FW_RELOAD_FAIL=1 makes it fail, as `/etc/init.d/firewall reload` returns the
+# reload's own status.
+_fw_reload() {
+    printf 'reload\n' >> "$T/reloads"; printf 'reload\n' >> "$T/seq"
+    [ "$FW_RELOAD_FAIL" != "1" ]
+}
 # Keep the engine's commit-failure flag, its serialization lock and its swap marker inside the case
 # sandbox rather than on the real /tmp, and point it at the ipcalc fake. Cases 17 and 17b run the
 # engine as a separate process, from a copy whose lock, marker and ipcalc lines point into $T too.
 KS_COMMIT_FAIL="$T/commit-failed"
+KS_RELOAD_FAIL="$T/reload-failed"
+KS_INTENTWARN="$T/intentwarn"
 KS_LOCK="$T/ks.lock"
 KS_SCOPEWARN="$T/scopewarn"
 KS_DEFROUTEWARN="$T/defroutewarn"
 KS_SWAP_MARK="$T/ts-fix-ks.srcswap"
 KS_IPCALC="$T/ipcalc/ipcalc.sh"
+# GL's Tor script, which disarm only reads: absent unless a G case writes one there (tor_sh).
+KS_TOR_SCRIPT="$T/tor.sh"
 # preboot runs only when TS_FIX_KS_BOOT=1; the suite must not inherit that from its environment.
 unset TS_FIX_KS_BOOT
 
@@ -571,7 +604,8 @@ reset() {   # $1 = fixture function
     # The swap marker goes, its temp files do not: one left behind by any case must still be there
     # for the end-of-run hygiene check to find.
     rm -f "$KS_COMMIT_FAIL" "$KS_SCOPEWARN" "$KS_DEFROUTEWARN" "$KS_SWAP_MARK" "$T/ipcalc/inject"
-    UCI_COMMIT_FAIL=""; UCI_SET_FAIL=""; UCI_ADDLIST_FAIL=""
+    rm -f "$KS_RELOAD_FAIL" "$KS_INTENTWARN"
+    UCI_COMMIT_FAIL=""; UCI_SET_FAIL=""; UCI_ADDLIST_FAIL=""; UCI_READ_FAIL=""; FW_RELOAD_FAIL=""
     IP4_DEFAULT=""; IP6_DEFAULT=""; UBUS_DUMP=""; IP_ABSENT_DEVS=""; IP_ADD_FAIL=""; IP_ADD_RACE=""
     IP4_BR_ADDR=""; IP_READ_FAIL=""; IP_READ_FAIL_SKIP=""; IP_DEL_FAIL=""; IP_DEL_RACE=""
     MKTEMP_FAIL=""; MKTEMP_RET=""; MV_FAIL=""; MARK_FOREIGN=""
@@ -602,6 +636,7 @@ addrs() {
     IP4_BR_ADDR=$(for spec; do br_line ${spec%% *} UP ${spec#* }; done)
 }
 gl_rule()  { printf 'S|-4|0|%s|all|lookup main\n' "$1"; }   # GL's "from <net> lookup main"
+iif_rule() { printf 'S|-4|0|%s|all|lookup main|%s\n' "$1" "$2"; }   # "from <net> iif <dev> lookup main"
 to_rule()  { printf 'S|-4|0|all|%s|lookup main\n' "$1"; }   # "to <net> lookup main": the swap's
                                                               # own, and GL's LAN/uplink rules
 seed_gl_lan() { seed "$(to_rule 192.168.50.0/24)" "$(to_rule 192.168.200.0/24)"; }
@@ -614,7 +649,8 @@ swapcalls() { grep -e ' priority 0' -e '-br addr' "$T/ip-calls"; }   # the swap'
 tmpleft()  { find "$T" -name 'ts-fix-ks.srcswap.*' | sed "s|^$T/||" | sort; }
 inode()    { set -- $(ls -i "$1" 2>/dev/null); printf '%s\n' "$1"; }   # set -f is on (sourced engine)
 ipcalc_inject() { printf '%s\n' "$@" > "$T/ipcalc/inject"; }    # <addr> <output line>...
-# GL's own condition for its source rule, per zone: an exit node set, network.<zone>.disabled='0'.
+# GL's own condition for its source rule, beyond Tailscale enabled in Router mode (fixture_mt3000,
+# which every caller starts from, has both): an exit node set, and network.<zone>.disabled='0'.
 gl_cond()  { uci set tailscale.settings.exit_node_ip=100.101.102.103; for z; do uci set "network.$z.disabled=0"; done; }
 # preboot runs only with TS_FIX_KS_BOOT=1, which /etc/init.d/ts-fix-preboot's boot() passes. Assign,
 # call, unset: `VAR=value function` is not a safe way to hand a variable to a function in ash/dash.
@@ -928,6 +964,34 @@ uci set firewall.zap=forwarding
 uci set firewall.zap.src=lan
 uci -q delete firewall.zap
 is "0 section delete removes its options" "" "$(g firewall.zap.src)"
+# The section form of show, which the engine's intent reads use, against the device format
+# (2026-10-04, GL 4.8.4/4.9.0/4.11.0): the section line first, then each option single-quoted; a
+# missing section or package is rc 1 with nothing printed.
+is "0 show of a section: its line, then its options, quoted" "ts-fix.settings=settings
+ts-fix.settings.kill_switch='1'
+ts-fix.settings.route_guest='0'" "$(uci -q show ts-fix.settings)"
+is "0 ... and tailscale.settings the same way" "tailscale.settings=settings
+tailscale.settings.enabled='1'" "$(uci -q show tailscale.settings)"
+uci -q show ts-fix.settings >/dev/null; is "0 ... rc 0" 0 "$?"
+x=$(uci -q show ts-fix.nosuch); rc=$?
+is "0 show of a missing section: nothing, rc 1" ":1" "$x:$rc"
+x=$(uci -q show nosuch.settings); rc=$?
+is "0 show of a section in a missing package: nothing, rc 1" ":1" "$x:$rc"
+x=$(uci -q show nosuch); rc=$?
+is "0 show of a missing package: nothing, rc 1" ":1" "$x:$rc"
+hasnt "0 the section form is section-scoped (no other section's options)" "firewall" "$(uci -q show ts-fix.settings)"
+UCI_READ_FAIL="tailscale"
+x=$(uci -q show tailscale.settings); r1=$?
+y=$(uci -q get tailscale.settings.enabled); r2=$?
+z=$(uci -q show ts-fix.settings | head -n 1); r3=$?
+UCI_READ_FAIL=""
+is "0 UCI_READ_FAIL fails a show and a get of that package (nothing, rc 1), and only that package" \
+    ":1 :1 ts-fix.settings=settings:0" "$x:$r1 $y:$r2 $z:$r3"
+UCI_READ_FAIL="ts-fix tailscale"
+x="$(uci -q show ts-fix.settings; echo "rc $?")|$(uci -q show tailscale.settings; echo "rc $?")|$(g glconfig.general.mode)"
+UCI_READ_FAIL=""
+is "0 ... several packages, space separated; a third still reads" "rc 1|rc 1|router" "$x"
+is "0 ... and nothing else changed: a later read works" "1" "$(g tailscale.settings.enabled)"
 
 echo "--- case 0b: instrument lint for the ip fake (format, detached variant, single-entry delete)"
 # Every expected string here was read from real iproute2 (see the fake's header comment).
@@ -1016,6 +1080,11 @@ jsonfilter -e '@.x' < /dev/null > /dev/null
 tailscale status > /dev/null
 printf 'x\n' | awk '{ print }' > /dev/null
 is "0c the reload fake counts"         1 "$(reloads)"
+_fw_reload; r1=$?
+FW_RELOAD_FAIL=1
+_fw_reload; r2=$?
+FW_RELOAD_FAIL=""
+is "0c the reload fake: rc 0, and rc 1 under FW_RELOAD_FAIL=1, each attempt counted" "0 1 3" "$r1 $r2 $(reloads)"
 is "0c ubus, jsonfilter and tailscale are recorded" "ubus call network.interface dump
 jsonfilter -e @.x
 tailscale status" "$(othercalls)"
@@ -1073,6 +1142,25 @@ is "0d-w ... but never a rule for another network" "2 $(gl_rule 10.20.0.0/16)" "
 ip -4 rule add to 10.20.0.0/16 lookup main priority 0; rc=$?
 is "0d-w 'to X' does not collide with 'from X'" "0 $(gl_rule 10.20.0.0/16)
 $(to_rule 10.20.0.0/16)" "$rc $(prio0)"
+echo "  0d-iif: a foreign rule with an input device, listed before GL's (the kernel's first-match delete)"
+reset fixture_mt3000
+seed "$(iif_rule 192.168.160.0/24 lo)" "$(gl_rule 192.168.160.0/24)"
+is "0d-iif it lists as iproute2 prints it, ahead of GL's" "0:${tab}from all lookup local
+0:${tab}from 192.168.160.0/24 iif lo lookup main
+0:${tab}from 192.168.160.0/24 lookup main" "$(ip -4 rule list priority 0)"
+ip -4 rule del priority 0 from 192.168.160.0/24 lookup main; rc=$?
+is "0d-iif a delete giving no iif takes the FIRST match, the foreign rule (device fact, 2026-10-04)" \
+    "0 $(gl_rule 192.168.160.0/24)" "$rc $(prio0)"
+ip -4 rule del priority 0 from 192.168.160.0/24 lookup main; rc=$?
+is "0d-iif ... the next delete takes GL's" "0 " "$rc $(prio0)"
+reset fixture_mt3000
+seed "$(gl_rule 192.168.160.0/24)" "$(iif_rule 192.168.160.0/24 lo)"
+ip -4 rule del priority 0 from 192.168.160.0/24 lookup main
+is "0d-iif listed the other way round, GL's goes first" "$(iif_rule 192.168.160.0/24 lo)" "$(prio0)"
+ip -4 rule add from 192.168.160.0/24 lookup main priority 0 2>/dev/null
+is "0d-iif an add meeting an iif rule is not modelled: it is recorded as unsupported" \
+    "add meeting an iif rule: $(iif_rule 192.168.160.0/24 lo)" "$(cat "$T/ip-unsupported")"
+: > "$T/ip-unsupported"     # that one was deliberate
 echo "  0d-a: the brief address listing"
 reset fixture_mt3000
 lo_line='lo               UNKNOWN        127.0.0.1/8 '
@@ -1746,6 +1834,650 @@ ks_main check > "$T/out" 2>&1
 is "15 next disarmed poll is free"     "" "$(commits)"
 is "15 and costs exactly one probe"    "-4 rule list priority 5279" "$(ipcalls)"
 
+# =============================================================================================
+# An intent read that FAILS. `uci -q get` prints nothing and returns 1 both for an absent option and
+# for a read that failed, so a failed read of kill_switch or enabled used to read as "no armed
+# intent": check then disarmed an armed router, arm removed the rule layer. The engine now reads
+# intent with `uci -q show <pkg>.settings`, which prints the section's own line first whenever the
+# section could be read. A failed read is UNKNOWN, and every subcommand holds on it.
+
+# u_armed — fixture_mt3000 armed, both layers in place and guest's source rule swapped; then the
+# state, the ip model and the marker are kept in $T/u-* for comparison, and the counters reset.
+u_armed() {
+    reset fixture_mt3000
+    addrs "br-lan 192.168.50.1/24" "br-guest 192.168.160.1/24"
+    seed_gl_lan
+    seed "$(gl_rule 192.168.160.0/24)"
+    gl_cond guest
+    ks_main arm > "$T/out" 2>&1
+    IP4_DEFAULT="default via 192.168.8.1 dev eth0 proto static"
+    UBUS_DUMP="eth0 wan"
+    cp "$STATE" "$T/u-state"; cp "$IPSTATE" "$T/u-ip"; cp "$KS_SWAP_MARK" "$T/u-mark" 2>/dev/null
+    counters_reset
+}
+u_same() {   # <label> — nothing of the armed router changed: config, kernel model, marker
+    if cmp -s "$T/u-state" "$STATE"; then ok "$1: the config is untouched"; else nok "$1: the config is untouched" "no writes" "state differs"; fi
+    if cmp -s "$T/u-ip" "$IPSTATE"; then ok "$1: the rules, the route and the swap are untouched"
+    else nok "$1: the rules, the route and the swap are untouched" "$(sort "$T/u-ip")" "$(ipstate)"; fi
+    if cmp -s "$T/u-mark" "$KS_SWAP_MARK"; then ok "$1: the swap marker is untouched"; else nok "$1: the swap marker is untouched" "unchanged" "changed or gone"; fi
+    is "$1: zero commits, zero reloads" ":0" "$(commits):$(reloads)"
+    is "$1: no ip delete or add" "" "$(grep -e ' del ' -e ' add ' "$T/ip-calls")"
+}
+
+echo "--- case U1: an armed router whose intent read fails: check holds, warns once, then recovers once"
+for pkg in tailscale ts-fix; do
+    u_armed
+    is "U1 $pkg non-vacuity: armed, rule layer, swap and record in place" \
+        "$(layer_state) lan:wan lan:zerotier guest:awgclient iot:wan guest:wan guest 192.168.160.0/24" \
+        "$(grep -v '^S|' "$IPSTATE" | sort) $(sev) $(marker)"
+    UCI_READ_FAIL="$pkg"
+    ks_main check > "$T/out" 2>&1; rc=$?
+    is "U1 $pkg: rc 1 (the kill switch is not known to be right)" 1 "$rc"
+    u_same "U1 $pkg"
+    is "U1 $pkg: exactly one log line" 1 "$(grep -c . "$T/log")"
+    has "U1 $pkg: a WARNING naming the read" "WARNING $pkg.settings could not be read" "$(logtext)"
+    has "U1 $pkg: ... saying the kill switch is held" "left exactly as it is" "$(logtext)"
+    counters_reset
+    ks_main check > "$T/out" 2>&1; rc=$?
+    is "U1 $pkg: a second failed check: rc 1, nothing logged" "1:" "$rc:$(logtext)"
+    u_same "U1 $pkg, again"
+    UCI_READ_FAIL=""
+    counters_reset
+    ks_main check > "$T/out" 2>&1; rc=$?
+    is "U1 $pkg: the next readable check: rc 0, one line saying the read recovered" "0 1" "$rc $(grep -c . "$T/log")"
+    has "U1 $pkg: ... which says so" "readable again" "$(logtext)"
+    u_same "U1 $pkg, readable"
+    counters_reset
+    ks_main check > "$T/out" 2>&1
+    is "U1 $pkg: and the check after that is silent" "" "$(logtext)"
+done
+
+echo "--- case U2: arm on a failed intent read: ERROR, rc 1, and NOTHING removed or written"
+u_armed
+UCI_READ_FAIL="tailscale"
+ks_main arm > "$T/out" 2>&1; rc=$?
+is "U2 rc 1"                           1 "$rc"
+u_same "U2"
+has "U2 an ERROR naming the read"      "ERROR arm: tailscale.settings could not be read" "$(logtext)"
+hasnt "U2 never 'no armed intent'"     "no armed intent" "$(logtext)"
+echo "  U2b: on a router not armed yet: no sever, no ip call at all"
+reset fixture_mt3000
+cp "$STATE" "$T/before"
+UCI_READ_FAIL="ts-fix"
+counters_reset
+ks_main arm > "$T/out" 2>&1; rc=$?
+is "U2b rc 1, zero ip calls, zero commits" "1::" "$rc:$(ipcalls):$(commits)"
+if cmp -s "$T/before" "$STATE"; then ok "U2b nothing written"; else nok "U2b nothing written" "no writes" "state differs"; fi
+
+echo "--- case U3: preboot on a failed intent read: ERROR, rc 1, nothing written"
+reset fixture_mt3000
+first_boot_state
+cp "$STATE" "$T/before"
+UCI_READ_FAIL="tailscale"
+counters_reset
+preboot_run; rc=$?
+is "U3 rc 1"                           1 "$rc"
+if cmp -s "$T/before" "$STATE"; then ok "U3 nothing re-severed, nothing written"; else nok "U3 nothing re-severed, nothing written" "no writes" "state differs"; fi
+is "U3 zero commits, zero reloads, zero ip calls" ":0:" "$(commits):$(reloads):$(ipcalls)"
+is "U3 exactly one log line"           1 "$(grep -c . "$T/log")"
+has "U3 an ERROR naming the read"      "ERROR preboot: tailscale.settings could not be read" "$(logtext)"
+
+echo "--- case U4: rules-ensure on a failed intent read is a no-op: no ip call, rc 1, silent"
+u_armed
+: > "$IPSTATE"                          # netifd wiped the rulebase
+UCI_READ_FAIL="tailscale"
+ks_main rules-ensure > "$T/out" 2>&1; rc=$?
+is "U4 rc 1, zero ip calls, nothing added" "1::" "$rc:$(ipcalls):$(cat "$IPSTATE")"
+is "U4 silent (the check owns the WARNING)" "" "$(logtext)"
+UCI_READ_FAIL=""
+ks_main rules-ensure > "$T/out" 2>&1; rc=$?
+is "U4 control: readable again, the same call re-adds the layer, rc 0" "0 $(layer_state)" "$rc $(grep -v '^S|' "$IPSTATE" | sort)"
+
+echo "--- case U5: a disarmed router whose read fails: not even the disarmed-branch cleanups run"
+# The stranded-rule-layer and lost-disarm backstops take protection DOWN, so they too wait for a
+# readable intent.
+u_armed
+uci set ts-fix.settings.kill_switch=0       # the toggle went off, the disarm was lost
+cp "$STATE" "$T/u-state"
+UCI_READ_FAIL="tailscale"
+ks_main check > "$T/out" 2>&1; rc=$?
+is "U5 lost disarm, read failing: rc 1" 1 "$rc"
+u_same "U5 lost disarm"
+is "U5 ... the record is kept"         "lan:wan lan:zerotier guest:awgclient iot:wan guest:wan" "$(sev)"
+u_armed
+uci set ts-fix.settings.kill_switch=0
+uci -q delete ts-fix.settings.ks_severed     # only the rule layer and the swap are left behind
+cp "$STATE" "$T/u-state"
+UCI_READ_FAIL="tailscale"
+ks_main check > "$T/out" 2>&1; rc=$?
+is "U5 stranded rule layer, read failing: rc 1, not even the 5279 probe" "1:" "$rc:$(ipcalls)"
+u_same "U5 stranded rule layer"
+
+echo "--- case U6: the controls - explicit enabled='0' and an ABSENT enabled are off, not unknown"
+u_armed
+uci set tailscale.settings.enabled=0
+ks_main check > "$T/out" 2>&1; rc=$?
+is "U6 enabled '0': rc 0, disarmed as before (lost-disarm path)" "0 1" "$rc $(g 'firewall.@forwarding[0].enabled')"
+is "U6 ... record dropped, rule layer gone" ":" "$(sev):$(grep -v '^S|' "$IPSTATE")"
+has "U6 ... the lost-disarm line"      "a disarm was lost" "$(logtext)"
+u_armed
+uci -q delete tailscale.settings.enabled    # GL's slider deletes it to restore a never-set state
+is "U6 non-vacuity: the section is still readable, with no enabled option" "tailscale.settings=settings|" \
+    "$(uci -q show tailscale.settings | head -n 1)|$(uci -q show tailscale.settings | grep -e '\.enabled=')"
+ks_main check > "$T/out" 2>&1; rc=$?
+is "U6 enabled ABSENT: rc 0, disarmed exactly the same way" "0 1" "$rc $(g 'firewall.@forwarding[0].enabled')"
+is "U6 ... record dropped, rule layer gone" ":" "$(sev):$(grep -v '^S|' "$IPSTATE")"
+hasnt "U6 ... no WARNING"              "WARNING" "$(logtext)"
+
+echo "--- case U7: arm's no-intent line reports the values it decided on, from the same two reads"
+reset fixture_mt3000
+uci set ts-fix.settings.kill_switch=0
+counters_reset
+ks_main arm > "$T/out" 2>&1; rc=$?
+is "U7 rc 0"                           0 "$rc"
+has "U7 the values as read"            "no armed intent (kill_switch='0' tailscale enabled='1')" "$(logtext)"
+is "U7 intent read once per package, with show, and never with get" \
+    "uci -q show ts-fix.settings
+uci -q show tailscale.settings" "$(grep -e 'ts-fix\.settings' -e 'tailscale\.settings' "$T/uci-calls" | grep -v -e 'ks_severed' -e 'exit_node_ip' -e 'route_guest')"
+reset fixture_mt3000
+uci -q delete tailscale.settings.enabled
+counters_reset
+ks_main arm > "$T/out" 2>&1
+has "U7 an absent option is named as absent" "kill_switch='1' tailscale enabled=(absent)" "$(logtext)"
+
+echo "--- case U8: the tmpfs flags are their shipping values, defined once"
+is "U8 KS_INTENTWARN, verbatim, defined once" 'KS_INTENTWARN="/tmp/ts-fix-ks.intentwarn"' "$(grep -e 'KS_INTENTWARN=' "$SRC")"
+is "U8 KS_RELOAD_FAIL, verbatim, defined once" 'KS_RELOAD_FAIL="/tmp/ts-fix-ks.reload-failed"' "$(grep -e 'KS_RELOAD_FAIL=' "$SRC")"
+
+# =============================================================================================
+# A firewall reload that FAILS. The zone layer's severing is committed to flash, but only a reload
+# makes it the running firewall's. A failed reload was ignored, and since the passes commit and
+# reload only when something changed, it was never retried: the kill switch reported armed with the
+# running firewall still forwarding.
+rl_lines() { grep -c -e 'ERROR firewall reload failed' "$T/log"; }
+
+echo "--- case RL1: a reload that fails on arm is rc 1 and an ERROR; the next checks retry the reload alone"
+reset fixture_mt3000
+FW_RELOAD_FAIL=1
+ks_main arm > "$T/out" 2>&1; rc=$?
+is "RL1 rc 1"                          1 "$rc"
+is "RL1 the commit landed, the reload was attempted once" "firewall
+ts-fix:1" "$(commits):$(reloads)"
+if [ -f "$KS_RELOAD_FAIL" ]; then ok "RL1 the failure is remembered"; else nok "RL1 the failure is remembered" "flag file" "absent"; fi
+if [ -f "$KS_COMMIT_FAIL" ]; then nok "RL1 ... as a reload failure, not a commit failure" "no commit flag" "commit flag"
+else ok "RL1 ... as a reload failure, not a commit failure"; fi
+is "RL1 one ERROR line"                1 "$(rl_lines)"
+has "RL1 ... saying the config is committed but not in force" "NOT in force" "$(logtext)"
+hasnt "RL1 never 'armed'"              "ks: armed" "$(logtext)"
+is "RL1 the rule layer is ensured anyway" "$(layer_state)" "$(ipstate)"
+counters_reset
+ks_main check > "$T/out" 2>&1; rc=$?
+is "RL1 next check, still failing: rc 1, ONE reload, ZERO commits (no flash write)" "1 1 " "$rc $(reloads) $(commits)"
+is "RL1 ... and no second ERROR line (rate-limited)" 0 "$(rl_lines)"
+FW_RELOAD_FAIL=""
+counters_reset
+ks_main check > "$T/out" 2>&1; rc=$?
+is "RL1 the reload succeeds: rc 0, one reload, zero commits" "0 1 " "$rc $(reloads) $(commits)"
+if [ -f "$KS_RELOAD_FAIL" ]; then nok "RL1 ... the flag is gone" "absent" "present"; else ok "RL1 ... the flag is gone"; fi
+is "RL1 ... one line, the recovery's" 1 "$(grep -c . "$T/log")"
+has "RL1 ... which says so"            "firewall reload succeeded" "$(logtext)"
+counters_reset
+ks_main check > "$T/out" 2>&1
+is "RL1 and the next check is quiet again: no reload, no log" "0:" "$(reloads):$(logtext)"
+
+echo "--- case RL2: thirteen failures in a row log the first and the thirteenth, and nothing between"
+reset fixture_mt3000
+FW_RELOAD_FAIL=1
+ks_main arm > "$T/out" 2>&1
+i=1
+while [ "$i" -lt 12 ]; do ks_main check > "$T/out" 2>&1; i=$((i + 1)); done
+is "RL2 twelve failures: twelve reloads, one ERROR line" "12 1" "$(reloads) $(rl_lines)"
+ks_main check > "$T/out" 2>&1
+is "RL2 the thirteenth: a second ERROR line" "13 2" "$(reloads) $(rl_lines)"
+has "RL2 ... naming the count"         "13 in a row" "$(grep 'ERROR firewall reload failed' "$T/log" | tail -n 1)"
+is "RL2 every retry was a reload alone: the arm's commits only" "firewall
+ts-fix" "$(commits)"
+
+echo "--- case RL3: disarm with a failing reload is rc 1; the disarmed check retries it"
+reset fixture_mt3000
+ks_main arm > "$T/out" 2>&1
+uci set ts-fix.settings.kill_switch=0
+FW_RELOAD_FAIL=1
+counters_reset
+ks_main disarm > "$T/out" 2>&1; rc=$?
+is "RL3 disarm rc 1"                   1 "$rc"
+if [ -f "$KS_RELOAD_FAIL" ]; then ok "RL3 the failure is remembered"; else nok "RL3 the failure is remembered" "flag file" "absent"; fi
+is "RL3 one ERROR line"                1 "$(rl_lines)"
+is "RL3 ... the restore itself was committed" "1:firewall
+ts-fix" "$(g 'firewall.@forwarding[0].enabled'):$(commits)"
+FW_RELOAD_FAIL=""
+counters_reset
+ks_main check > "$T/out" 2>&1; rc=$?
+is "RL3 the disarmed check retries: rc 0, one reload, zero commits" "0 1 " "$rc $(reloads) $(commits)"
+if [ -f "$KS_RELOAD_FAIL" ]; then nok "RL3 ... the flag is gone" "absent" "present"; else ok "RL3 ... the flag is gone"; fi
+has "RL3 ... one recovery line"        "firewall reload succeeded" "$(logtext)"
+
+echo "--- case RL4: preboot never reloads, even with a reload failure remembered"
+reset fixture_mt3000
+ks_main arm > "$T/out" 2>&1
+printf '1\n' > "$KS_RELOAD_FAIL"
+counters_reset
+preboot_run; rc=$?
+is "RL4 rc 0, zero reloads, no log"    "0 0 " "$rc $(reloads) $(logtext)"
+if [ -f "$KS_RELOAD_FAIL" ]; then ok "RL4 the flag is left for the next check"; else nok "RL4 the flag is left for the next check" "present" "absent"; fi
+
+echo "--- case RL5: a count that cannot be read counts as one - a full /tmp never turns into a log line per poll"
+for c in garbage "" ; do
+    reset fixture_mt3000
+    ks_main arm > "$T/out" 2>&1
+    printf '%s' "$c" > "$KS_RELOAD_FAIL"
+    FW_RELOAD_FAIL=1
+    counters_reset
+    ks_main check > "$T/out" 2>&1; rc=$?
+    is "RL5 flag holding '$c': rc 1, one reload, no ERROR line" "1 1 0" "$rc $(reloads) $(rl_lines)"
+done
+
+echo "--- case RL6: a check that changed something with a reload failure remembered: one commit, ONE reload"
+reset fixture_mt3000
+ks_main arm > "$T/out" 2>&1
+printf '3\n' > "$KS_RELOAD_FAIL"
+uci set 'firewall.@forwarding[0].enabled=1'      # GL re-emitted it
+counters_reset
+ks_main check > "$T/out" 2>&1; rc=$?
+is "RL6 rc 0, committed, exactly one reload" "0 1" "$rc $(reloads)"
+is "RL6 ... both packages committed" "firewall
+ts-fix" "$(commits)"
+if [ -f "$KS_RELOAD_FAIL" ]; then nok "RL6 ... the flag is gone" "absent" "present"; else ok "RL6 ... the flag is gone"; fi
+has "RL6 ... with the recovery line"   "firewall reload succeeded after 3" "$(logtext)"
+
+# =============================================================================================
+# Forwardings GL owns at disarm. Two stock GL features turn off the very forwardings the zone layer
+# severs, and can do so while the kill switch is armed; a disarm must not switch them back on. It
+# leaves each such section disabled — no write, and no write failure, so the sidecar still goes —
+# with one log line naming the section, its pair and the reason.
+#   GL Tor: while tor.global.enable is '1', GL keeps the first forwarding section of the firewall
+#     config disabled (uci's @forwarding[0], lan -> wan on stock configs). 4.8.4 and 4.9.0 do the
+#     same to firewall.guestzone_fwd, which counts only where the installed Tor script names it
+#     (KS_TOR_SCRIPT, this suite's $T/tor.sh).
+#   GL 4.11's per-network "block all WAN" (wan_access_mode 2): every <net> -> wan and <net> -> wan6
+#     forwarding disabled, and gl-black_white_list.<net>_transfer_enable.transfer_enable set to
+#     '0'; never for lan. The older gl-black_white_list.<net>.transfer_enable reads '0' on routers
+#     whose guest and iot are online, so it means something else (case G7).
+# The uci fake declares no section for tor or gl-black_white_list: the engine reads one option of
+# each, and the fake answers an option whether or not its section was declared.
+tor_on()    { uci set tor.global.enable=1; }
+tor_sh()    {   # mention | plain | missing — the installed GL Tor script, which disarm greps
+    case "$1" in
+        mention) printf '%s\n' '#!/bin/sh' 'uci set firewall.@forwarding[0].enabled="0"' \
+                     'uci set firewall.guestzone_fwd.enabled="0"' > "$KS_TOR_SCRIPT" ;;
+        plain)   printf '%s\n' '#!/bin/sh' 'uci set firewall.@forwarding[0].enabled="0"' > "$KS_TOR_SCRIPT" ;;
+        missing) rm -f "$KS_TOR_SCRIPT" ;;
+    esac
+}
+wan_block() { uci set "gl-black_white_list.$1_transfer_enable.transfer_enable=$2"; }   # <net> <value>
+g_disarm()  { counters_reset; ks_main disarm > "$T/out" 2>&1; rc=$?; }
+# The engine's exact log lines, as the logger fake records them.
+left_line() { printf '%s\n' "-t ts-fix ks: disarm left $1 ($2) disabled - $3"; }     # <sec> <pair> <why>
+sum_line()  { printf '%s\n' "-t ts-fix ks: disarmed - recorded pairs: $1; every forwarding of theirs is now enabled unless named above"; }
+why_tor="GL Tor is on and manages it"
+why_guest="GL blocks internet access for guest"
+# The first forwarding section in the fixture's `uci show firewall`, read the way the engine reads
+# its enumeration; and a fixture section renamed in every record that names it.
+first_fwd() { uci show firewall | sed -n 's/^\(firewall\.[^.=]*\)=forwarding$/\1/p' | head -n 1; }
+ren_fwd()   {   # <index> <name> — firewall.@forwarding[<index>] becomes firewall.<name>
+    sed -e "s/|firewall\.@forwarding\[$1]/|firewall.$2/" "$STATE" > "$T/state.ren"
+    mv "$T/state.ren" "$STATE"
+}
+# fixture_mt3000 plus a NAMED wan6 zone with a guest -> wan6 forwarding (GL's block covers both zone
+# names), and guest -> wwan into a zone named wwan: uplink-class, so severed and recorded, but not
+# one of the two zone names GL's block writes.
+fixture_gl_owned() {
+    fixture_mt3000
+    cat >> "$STATE" <<'EOF'
+S|firewall.wan6|zone
+O|firewall.wan6.name|wan6
+O|firewall.wan6.network|wan6
+S|firewall.wwan|zone
+O|firewall.wwan.name|wwan
+O|firewall.wwan.network|wwan
+S|firewall.guest_wan6|forwarding
+O|firewall.guest_wan6.src|guest
+O|firewall.guest_wan6.dest|wan6
+O|firewall.guest_wan6.enabled|1
+S|firewall.guest_wwan|forwarding
+O|firewall.guest_wwan.src|guest
+O|firewall.guest_wwan.dest|wwan
+O|firewall.guest_wwan.enabled|1
+EOF
+}
+# fixture_mt3000 plus 4.8.4/4.9.0's named guest -> wan forwarding, and a near-miss name beside it.
+fixture_guestzone() {
+    fixture_mt3000
+    cat >> "$STATE" <<'EOF'
+S|firewall.guestzone_fwd|forwarding
+O|firewall.guestzone_fwd.src|guest
+O|firewall.guestzone_fwd.dest|wan
+O|firewall.guestzone_fwd.enabled|1
+S|firewall.guestzone_fwd2|forwarding
+O|firewall.guestzone_fwd2.src|guest
+O|firewall.guestzone_fwd2.dest|wan
+O|firewall.guestzone_fwd2.enabled|1
+EOF
+}
+# fixture_484 with its first forwarding under the other names it can print as: an anonymous section
+# by its raw name (`uci -X show` prints the first anonymous forwarding of a config as cfg04ad58),
+# and a real name, which uci also resolves as @forwarding[0] when that section comes first.
+fixture_cfg_first()   { fixture_484; ren_fwd 0 cfg04ad58; ren_fwd 1 cfg05ad58; }
+fixture_named_first() { fixture_484; ren_fwd 0 lan2wan; }
+
+echo "--- case G0: instrument lint for the G cases (fixtures, the Tor script, GL's keys)"
+reset fixture_gl_owned
+ks_main arm > "$T/out" 2>&1
+is "G0 the extended MT3000 shape records guest:wan6 and guest:wwan too" \
+    "lan:wan lan:zerotier guest:awgclient iot:wan guest:wan guest:wan6 guest:wwan" "$(sev)"
+is "G0 ... and severs both"            "0 0" "$(g firewall.guest_wan6.enabled) $(g firewall.guest_wwan.enabled)"
+tor_on
+wan_block guest 0
+uci set gl-black_white_list.guest.transfer_enable=1
+is "G0 the fake reads GL's keys back, each under its own path" "1 0 1" \
+    "$(g tor.global.enable) $(g gl-black_white_list.guest_transfer_enable.transfer_enable) $(g gl-black_white_list.guest.transfer_enable)"
+hasnt "G0 ... and none of them is in the firewall capture" "transfer_enable" "$(uci show firewall)"
+tor_sh mention; grep -q guestzone_fwd "$KS_TOR_SCRIPT"; r1=$?
+tor_sh plain;   grep -q guestzone_fwd "$KS_TOR_SCRIPT"; r2=$?
+tor_sh missing; grep -q guestzone_fwd "$KS_TOR_SCRIPT" 2>/dev/null; r3=$?
+[ "$r3" -gt 1 ] && r3=error
+is "G0 the Tor script fixture discriminates: names it, does not, is missing" "0 1 error" "$r1 $r2 $r3"
+for spec in fixture_mt3000:firewall.@forwarding[0] fixture_cfg_first:firewall.cfg04ad58 \
+            fixture_named_first:firewall.lan2wan; do
+    reset "${spec%%:*}"
+    is "G0 ${spec%%:*}: the first forwarding is ${spec#*:}, lan -> wan" "${spec#*:} lan wan" \
+        "$(first_fwd) $(g "${spec#*:}.src") $(g "${spec#*:}.dest")"
+done
+reset fixture_cfg_first
+hasnt "G0 fixture_cfg_first: no @forwarding path is left in it" "@forwarding[" "$(uci show firewall)"
+is "G0 ... its second forwarding is cfg05ad58, guest -> wan" "guest wan" \
+    "$(g firewall.cfg05ad58.src) $(g firewall.cfg05ad58.dest)"
+
+echo "--- case G1: GL Tor on: disarm leaves @forwarding[0] disabled, restores the rest, drops the sidecar"
+reset fixture_mt3000
+ks_main arm > "$T/out" 2>&1
+tor_on
+tor_sh plain
+g_disarm
+is "G1 rc"                             0 "$rc"
+is "G1 lan:wan, @forwarding[0], left disabled" 0 "$(g 'firewall.@forwarding[0].enabled')"
+is "G1 ... with no write to it"        "" "$(grep -F 'firewall.@forwarding[0].enabled=1' "$T/uci-calls")"
+is "G1 every other recorded pair restored" "1 1 1 1" \
+    "$(g firewall.lan_zerotier.enabled) $(g 'firewall.@forwarding[7].enabled') $(g 'firewall.@forwarding[11].enabled') $(g 'firewall.@forwarding[14].enabled')"
+is "G1 sidecar dropped: a section left disabled is not a failed restore" "" "$(sev)"
+is "G1 our lan2ts removed as usual"    "" "$(g firewall.ts_fix_lan2ts)"
+is "G1 the log: one line for the section Tor manages, then the summary" \
+    "$(left_line 'firewall.@forwarding[0]' lan:wan "$why_tor")
+$(sum_line 'lan:wan lan:zerotier guest:awgclient iot:wan guest:wan')" "$(logtext)"
+is "G1 commits both packages"          "firewall
+ts-fix" "$(commits)"
+is "G1 one firewall reload"            1 "$(reloads)"
+is "G1 nothing on stdout or stderr"    "" "$(cat "$T/out")"
+echo "  G1b: afterwards a disarm, and the disarmed poll, find nothing left to do"
+g_disarm
+is "G1b a second disarm: rc 0, no commit, no log" "0::" "$rc:$(commits):$(logtext)"
+is "G1b ... it reads no GL state: nothing is recorded" 0 "$(grep -c -e 'tor\.global' -e 'gl-black_white_list' "$T/uci-calls")"
+is "G1b ... and @forwarding[0] is still disabled" 0 "$(g 'firewall.@forwarding[0].enabled')"
+uci set ts-fix.settings.kill_switch=0
+counters_reset
+ks_main check > "$T/out" 2>&1
+is "G1b the disarmed poll sees no lost disarm: its one probe, no log, no commit" \
+    "-4 rule list priority 5279::" "$(ipcalls):$(logtext):$(commits)"
+echo "  G1c: Tor on, @forwarding[0] enabled: nothing to leave disabled, so no line"
+reset fixture_mt3000
+ks_main arm > "$T/out" 2>&1
+uci set 'firewall.@forwarding[0].enabled=1'
+tor_on
+tor_sh plain
+g_disarm
+is "G1c rc"                            0 "$rc"
+is "G1c @forwarding[0] stays enabled"  1 "$(g 'firewall.@forwarding[0].enabled')"
+hasnt "G1c no line: it was not left disabled" "disarm left" "$(logtext)"
+
+echo "--- case G2: Tor off, not exactly '1', or absent: @forwarding[0] is restored (controls)"
+for torval in 0 true absent; do
+    reset fixture_mt3000
+    ks_main arm > "$T/out" 2>&1
+    [ "$torval" = "absent" ] || uci set "tor.global.enable=$torval"
+    tor_sh mention                  # a Tor script that names guestzone_fwd changes nothing either
+    g_disarm
+    is "G2 tor.global.enable $torval: rc 0" 0 "$rc"
+    is "G2 tor.global.enable $torval: @forwarding[0] restored" 1 "$(g 'firewall.@forwarding[0].enabled')"
+    is "G2 tor.global.enable $torval: sidecar dropped" "" "$(sev)"
+    hasnt "G2 tor.global.enable $torval: nothing left disabled" "disarm left" "$(logtext)"
+done
+
+echo "--- case G3: Tor's section is @forwarding[0] by position: a lan:wan that comes second is restored"
+reset fixture_484
+uci set 'firewall.@forwarding[0].dest=tailscale0'     # the first forwarding leads into the tunnel
+uci set 'firewall.@forwarding[1].src=lan'             # and lan -> wan comes second
+ks_main arm > "$T/out" 2>&1
+is "G3 non-vacuity: lan:wan, the second forwarding, severed and recorded" "0 lan:wan" \
+    "$(g 'firewall.@forwarding[1].enabled') $(sev)"
+tor_on
+tor_sh plain
+g_disarm
+is "G3 rc"                             0 "$rc"
+is "G3 the second forwarding, lan:wan, restored" 1 "$(g 'firewall.@forwarding[1].enabled')"
+hasnt "G3 nothing left disabled"       "disarm left" "$(logtext)"
+is "G3 sidecar dropped"                "" "$(sev)"
+echo "  G3b: whatever pair the first forwarding carries, it is the one Tor keeps disabled"
+reset fixture_484
+uci set 'firewall.@forwarding[0].src=guest'           # guest -> wan first
+uci set 'firewall.@forwarding[1].src=lan'             # lan -> wan second
+ks_main arm > "$T/out" 2>&1
+is "G3b non-vacuity: both severed, both recorded" "0 0 guest:wan lan:wan" \
+    "$(g 'firewall.@forwarding[0].enabled') $(g 'firewall.@forwarding[1].enabled') $(sev)"
+tor_on
+tor_sh plain
+g_disarm
+is "G3b rc"                            0 "$rc"
+is "G3b the first forwarding, guest:wan, left disabled" 0 "$(g 'firewall.@forwarding[0].enabled')"
+is "G3b the second, lan:wan, restored" 1 "$(g 'firewall.@forwarding[1].enabled')"
+is "G3b one line, naming the first section and its pair" \
+    "$(left_line 'firewall.@forwarding[0]' guest:wan "$why_tor")" "$(grep -e 'disarm left' "$T/log")"
+
+echo "--- case G4: the first forwarding in either other naming form: a raw cfg name, a real name"
+for spec in fixture_cfg_first:firewall.cfg04ad58:firewall.cfg05ad58 \
+            fixture_named_first:firewall.lan2wan:firewall.@forwarding[1]; do
+    fx="${spec%%:*}"; rest="${spec#*:}"; first="${rest%%:*}"; second="${rest#*:}"
+    reset "$fx"
+    ks_main arm > "$T/out" 2>&1
+    is "G4 $first: non-vacuity: it and $second (guest:wan) severed and recorded" \
+        "0 0 lan:wan guest:wan" "$(g "$first.enabled") $(g "$second.enabled") $(sev)"
+    tor_on
+    tor_sh plain
+    g_disarm
+    is "G4 $first: rc 0"               0 "$rc"
+    is "G4 $first: left disabled"      0 "$(g "$first.enabled")"
+    is "G4 $first: $second restored"   1 "$(g "$second.enabled")"
+    is "G4 $first: the line names it in that form" "$(left_line "$first" lan:wan "$why_tor")" \
+        "$(grep -e 'disarm left' "$T/log")"
+    is "G4 $first: sidecar dropped"    "" "$(sev)"
+done
+
+echo "--- case G5: guestzone_fwd is Tor's only where the installed Tor script names it"
+g5() {   # <tor.global.enable value, or absent> <mention | plain | missing>
+    reset fixture_guestzone
+    ks_main arm > "$T/out" 2>&1
+    [ "$1" = "absent" ] || uci set "tor.global.enable=$1"
+    tor_sh "$2"
+    g_disarm
+}
+reset fixture_guestzone
+ks_main arm > "$T/out" 2>&1
+is "G5 non-vacuity: arm severs guestzone_fwd and guestzone_fwd2, under the one guest:wan" \
+    "0 0 lan:wan lan:zerotier guest:awgclient iot:wan guest:wan" \
+    "$(g firewall.guestzone_fwd.enabled) $(g firewall.guestzone_fwd2.enabled) $(sev)"
+g5 1 mention
+is "G5 Tor on, the script names it: rc 0" 0 "$rc"
+is "G5 ... guestzone_fwd and @forwarding[0] left disabled" "0 0" \
+    "$(g firewall.guestzone_fwd.enabled) $(g 'firewall.@forwarding[0].enabled')"
+is "G5 ... the near-miss guestzone_fwd2 and @forwarding[14], guest:wan both, restored" "1 1" \
+    "$(g firewall.guestzone_fwd2.enabled) $(g 'firewall.@forwarding[14].enabled')"
+is "G5 ... one line per section left, in enumeration order" \
+    "$(left_line 'firewall.@forwarding[0]' lan:wan "$why_tor")
+$(left_line firewall.guestzone_fwd guest:wan "$why_tor")" "$(grep -e 'disarm left' "$T/log")"
+is "G5 ... sidecar dropped"            "" "$(sev)"
+g5 1 plain
+is "G5 Tor on, the script does not name it: guestzone_fwd restored, @forwarding[0] left" "1 0" \
+    "$(g firewall.guestzone_fwd.enabled) $(g 'firewall.@forwarding[0].enabled')"
+is "G5 ... one line, for @forwarding[0]" "$(left_line 'firewall.@forwarding[0]' lan:wan "$why_tor")" \
+    "$(grep -e 'disarm left' "$T/log")"
+g5 1 missing
+is "G5 Tor on, no Tor script: guestzone_fwd restored, @forwarding[0] left" "1 0" \
+    "$(g firewall.guestzone_fwd.enabled) $(g 'firewall.@forwarding[0].enabled')"
+is "G5 ... rc 0, and nothing on stdout or stderr from the missing file" "0:" "$rc:$(cat "$T/out")"
+g5 0 mention
+is "G5 Tor off, the script names it: both restored" "1 1" \
+    "$(g firewall.guestzone_fwd.enabled) $(g 'firewall.@forwarding[0].enabled')"
+hasnt "G5 ... nothing left disabled"   "disarm left" "$(logtext)"
+
+echo "--- case G6: GL blocks all WAN for guest: guest -> wan and guest -> wan6 stay disabled, the rest returns"
+reset fixture_gl_owned
+ks_main arm > "$T/out" 2>&1
+wan_block guest 0
+g_disarm
+is "G6 rc"                             0 "$rc"
+is "G6 guest:wan and guest:wan6 left disabled" "0 0" \
+    "$(g 'firewall.@forwarding[14].enabled') $(g firewall.guest_wan6.enabled)"
+is "G6 ... with no write to either"    "" \
+    "$(grep -F -e 'firewall.@forwarding[14].enabled=1' -e 'firewall.guest_wan6.enabled=1' "$T/uci-calls")"
+is "G6 guest's others restored: awgclient, and wwan (a zone name GL's block never writes)" "1 1" \
+    "$(g 'firewall.@forwarding[7].enabled') $(g firewall.guest_wwan.enabled)"
+is "G6 lan and iot restored"           "1 1 1" \
+    "$(g 'firewall.@forwarding[0].enabled') $(g firewall.lan_zerotier.enabled) $(g 'firewall.@forwarding[11].enabled')"
+is "G6 sidecar dropped"                "" "$(sev)"
+is "G6 the log: one line per section left, then the summary" \
+    "$(left_line 'firewall.@forwarding[14]' guest:wan "$why_guest")
+$(left_line firewall.guest_wan6 guest:wan6 "$why_guest")
+$(sum_line 'lan:wan lan:zerotier guest:awgclient iot:wan guest:wan guest:wan6 guest:wwan')" "$(logtext)"
+echo "  G6b: transfer_enable '1' (internet allowed): everything is restored"
+reset fixture_gl_owned
+ks_main arm > "$T/out" 2>&1
+wan_block guest 1
+g_disarm
+is "G6b rc"                            0 "$rc"
+is "G6b guest:wan and guest:wan6 restored" "1 1" \
+    "$(g 'firewall.@forwarding[14].enabled') $(g firewall.guest_wan6.enabled)"
+hasnt "G6b nothing left disabled"      "disarm left" "$(logtext)"
+echo "  G6c: the key is per network: iot blocked, guest not"
+reset fixture_gl_owned
+ks_main arm > "$T/out" 2>&1
+wan_block iot 0
+g_disarm
+is "G6c iot:wan left disabled; guest:wan and guest:wan6 restored" "0 1 1" \
+    "$(g 'firewall.@forwarding[11].enabled') $(g 'firewall.@forwarding[14].enabled') $(g firewall.guest_wan6.enabled)"
+is "G6c one line, naming iot" "$(left_line 'firewall.@forwarding[11]' iot:wan 'GL blocks internet access for iot')" \
+    "$(grep -e 'disarm left' "$T/log")"
+
+echo "--- case G7: the older gl-black_white_list.<net>.transfer_enable is not GL's block (TRAP control)"
+# It reads '0' on live routers whose guest and iot are online. Taking it for the block would leave
+# guest and iot offline after every disarm; with no <net>_transfer_enable section nothing is blocked.
+reset fixture_gl_owned
+ks_main arm > "$T/out" 2>&1
+uci set gl-black_white_list.guest.transfer_enable=0
+uci set gl-black_white_list.iot.transfer_enable=0
+g_disarm
+is "G7 rc"                             0 "$rc"
+is "G7 guest:wan, guest:wan6 and iot:wan restored" "1 1 1" \
+    "$(g 'firewall.@forwarding[14].enabled') $(g firewall.guest_wan6.enabled) $(g 'firewall.@forwarding[11].enabled')"
+is "G7 sidecar dropped"                "" "$(sev)"
+hasnt "G7 nothing left disabled"       "disarm left" "$(logtext)"
+
+echo "--- case G8: GL's block never applies to lan, nor to a dest other than wan or wan6"
+reset fixture_gl_owned
+ks_main arm > "$T/out" 2>&1
+wan_block lan 0
+wan_block guest 0
+g_disarm
+is "G8 rc"                             0 "$rc"
+is "G8 lan:wan restored: lan is never in that mode" 1 "$(g 'firewall.@forwarding[0].enabled')"
+is "G8 guest:wwan restored: wwan is not wan or wan6" 1 "$(g firewall.guest_wwan.enabled)"
+is "G8 non-vacuity: guest:wan and guest:wan6 left disabled in the same pass" "0 0" \
+    "$(g 'firewall.@forwarding[14].enabled') $(g firewall.guest_wan6.enabled)"
+hasnt "G8 no line names lan"           "(lan:" "$(logtext)"
+
+echo "--- case G9: a restore that fails still keeps the record; a section left disabled is no failure"
+reset fixture_mt3000
+ks_main arm > "$T/out" 2>&1
+tor_on
+tor_sh plain
+UCI_SET_FAIL="@forwarding[14].enabled=1"
+g_disarm
+UCI_SET_FAIL=""
+is "G9 rc is 1"                        1 "$rc"
+is "G9 the failed one stays severed, the one Tor manages stays disabled" "0 0" \
+    "$(g 'firewall.@forwarding[14].enabled') $(g 'firewall.@forwarding[0].enabled')"
+is "G9 the others restored"            "1 1 1" \
+    "$(g firewall.lan_zerotier.enabled) $(g 'firewall.@forwarding[7].enabled') $(g 'firewall.@forwarding[11].enabled')"
+is "G9 record kept for the retry"      "lan:wan lan:zerotier guest:awgclient iot:wan guest:wan" "$(sev)"
+has "G9 the section Tor manages is reported as left, not failed" \
+    "$(left_line 'firewall.@forwarding[0]' lan:wan "$why_tor")" "$(logtext)"
+is "G9 every ERROR is about the failed write" "-t ts-fix ks: ERROR uci set 'firewall.@forwarding[14].enabled=1' failed - guest:wan stays severed
+-t ts-fix ks: ERROR some forwardings could not be re-enabled - keeping the record (lan:wan lan:zerotier guest:awgclient iot:wan guest:wan) so the next disarm retries" \
+    "$(grep -e ERROR "$T/log")"
+g_disarm
+is "G9 retry: rc 0"                    0 "$rc"
+is "G9 retry: guest:wan restored, @forwarding[0] still disabled" "1 0" \
+    "$(g 'firewall.@forwarding[14].enabled') $(g 'firewall.@forwarding[0].enabled')"
+is "G9 retry: record dropped"          "" "$(sev)"
+echo "  G9b: every recorded section left disabled: no firewall write at all, and the record goes"
+reset fixture_484
+ks_main arm > "$T/out" 2>&1
+tor_on
+tor_sh plain
+wan_block guest 0
+g_disarm
+is "G9b rc"                            0 "$rc"
+is "G9b lan:wan (Tor's) and guest:wan (GL's block) both left disabled" "0 0" \
+    "$(g 'firewall.@forwarding[0].enabled') $(g 'firewall.@forwarding[1].enabled')"
+is "G9b no enabled=1 write at all"     "" "$(grep -F '.enabled=1' "$T/uci-calls")"
+is "G9b sidecar dropped"               "" "$(sev)"
+is "G9b ... and that is committed"     "firewall
+ts-fix" "$(commits)"
+is "G9b the log: both lines, then the summary" \
+    "$(left_line 'firewall.@forwarding[0]' lan:wan "$why_tor")
+$(left_line 'firewall.@forwarding[1]' guest:wan "$why_guest")
+$(sum_line 'lan:wan guest:wan')" "$(logtext)"
+echo "  G9c: a section both features own is left disabled once, with one line"
+reset fixture_484
+uci set 'firewall.@forwarding[0].src=guest'
+uci set 'firewall.@forwarding[1].src=lan'
+ks_main arm > "$T/out" 2>&1
+tor_on
+tor_sh plain
+wan_block guest 0
+g_disarm
+is "G9c rc"                            0 "$rc"
+is "G9c guest:wan, @forwarding[0], left disabled; lan:wan restored" "0 1" \
+    "$(g 'firewall.@forwarding[0].enabled') $(g 'firewall.@forwarding[1].enabled')"
+is "G9c exactly one line, and only one" "$(left_line 'firewall.@forwarding[0]' guest:wan "$why_tor")" \
+    "$(grep -e 'disarm left' "$T/log")"
+
+echo "--- case G10: only disarm reads GL's Tor and WAN-block state; arm and the armed poll do not"
+reset fixture_gl_owned
+tor_on
+tor_sh mention
+wan_block guest 0
+counters_reset
+ks_main arm > "$T/out" 2>&1
+ks_main check > "$T/out" 2>&1
+is "G10 non-vacuity: armed, all three severed" "0 0 0" \
+    "$(g 'firewall.@forwarding[0].enabled') $(g 'firewall.@forwarding[14].enabled') $(g firewall.guest_wan6.enabled)"
+is "G10 neither read GL's state"       0 "$(grep -c -e 'tor\.global' -e 'gl-black_white_list' "$T/uci-calls")"
+
+echo "--- case GK: KS_TOR_SCRIPT is its shipping value, defined once, never taken from the environment"
+is "GK KS_TOR_SCRIPT, verbatim, defined once" 'KS_TOR_SCRIPT=/usr/bin/tor.sh' "$(grep -e 'KS_TOR_SCRIPT=' "$SRC")"
+got=$(KS_TOR_SCRIPT="$T/evil-tor" TS_FIX_KS_NO_MAIN=1 /bin/sh -c '. "$1"; printf "%s" "$KS_TOR_SCRIPT"' _ "$SRC")
+is "GK an environment value never replaces it" "/usr/bin/tor.sh" "$got"
+tor_sh missing                                  # leave no Tor script behind for the cases below
+
 echo "--- case 18: scope holes the zone model cannot close are warned about, once"
 # Neither condition is rewritten — policy belongs to the user — but an armed engine must never
 # report armed while lan/guest/iot traffic can leave through a path the severed forwardings do not
@@ -2403,9 +3135,10 @@ seed_gl_lan
 seed "$(gl_rule 192.168.160.0/24)"
 ks_main arm > "$T/out" 2>&1; rc=$?
 is "S1 rc"                             0 "$rc"
-is "S1 the swap's ip calls, in order"  "-4 -br addr
+is "S1 the swap's ip calls, in order: the delete is read back before it counts (case SF)" "-4 -br addr
 -4 rule list priority 0
 -4 rule del priority 0 from 192.168.160.0/24 lookup main
+-4 rule list priority 0
 -4 rule add to 192.168.160.0/24 lookup main priority 0" "$(swapcalls)"
 is "S1 GL's rule gone, ours in place, the LAN rules untouched" "$(to_rule 192.168.50.0/24)
 $(to_rule 192.168.200.0/24)
@@ -2585,7 +3318,9 @@ counters_reset
 ks_main check > "$T/out" 2>&1
 is "S8b exactly the one probe"         "-4 rule list priority 5279" "$(ipcalls)"
 is "S8b the rule is untouched"         "$(to_rule 192.168.160.0/24)" "$(prio0)"
-is "S8b no ipcalc, no uci beyond the gates" "::" "$(ipcalcs):$(grep -v -e 'kill_switch' -e 'ks_severed' "$T/uci-calls"):$(logtext)"
+# The gates: the intent's two section reads, and the sidecar read.
+is "S8b no ipcalc, no uci beyond the gates" "::" \
+    "$(ipcalcs):$(grep -v -x -e 'uci -q show ts-fix.settings' -e 'uci -q show tailscale.settings' -e '.*ks_severed' "$T/uci-calls"):$(logtext)"
 echo "  S8c: a stale marker whose swap is already gone still gets its one line, and goes"
 reset fixture_mt3000
 uci set ts-fix.settings.kill_switch=0
@@ -2683,7 +3418,9 @@ IP_ADD_RACE="-4 rule add to 192.168.160.0/24"
 _ks_swap_ensure > "$T/out" 2>&1; rc=$?
 is "S11 an add lost to a concurrent pass (EEXIST): rc 0" 0 "$rc"
 hasnt "S11 ... no ERROR"               "ERROR" "$(logtext)"
-is "S11 ... ONE extra rule list"       2 "$(grep -cxF -e '-4 rule list priority 0' "$T/ip-calls")"
+# Three lists: the pass's own, the read-back of its delete of GL's rule (case SF), and ONE for the
+# add.
+is "S11 ... ONE extra rule list for the add" 3 "$(grep -cxF -e '-4 rule list priority 0' "$T/ip-calls")"
 is "S11 ... ours there once, GL's gone" "$(to_rule 192.168.160.0/24)" "$(prio0)"
 is "S11 ... the marker is written"     "guest 192.168.160.0/24" "$(marker)"
 hasnt "S11 ... the log does not claim the winner's add" "added the to-rule" "$(logtext)"
@@ -2700,7 +3437,7 @@ IP_ADD_FAIL="-4 rule add to 192.168.160.0/24"
 _ks_swap_ensure > "$T/out" 2>&1; rc=$?
 is "S11 an add that fails while the rule stays absent: rc 1" 1 "$rc"
 has "S11 ... an ERROR naming it"       "ERROR source-rule swap incomplete: the to-rule for guest 192.168.160.0/24 is still absent" "$(logtext)"
-is "S11 ... after ONE extra rule list" 2 "$(grep -cxF -e '-4 rule list priority 0' "$T/ip-calls")"
+is "S11 ... after ONE extra rule list for the add (the third: see above)" 3 "$(grep -cxF -e '-4 rule list priority 0' "$T/ip-calls")"
 is "S11 ... the network is still recorded, so a disarm will look for it" "guest 192.168.160.0/24" "$(marker)"
 s11
 IP_DEL_FAIL="-4 rule del priority 0 from 192.168.160.0/24"
@@ -2713,6 +3450,61 @@ IP_READ_FAIL="-4 rule list priority 0"; IP_READ_FAIL_SKIP=1
 _ks_swap_ensure > "$T/out" 2>&1; rc=$?
 is "S11 a failed add whose read-back cannot be taken: rc 1" 1 "$rc"
 has "S11 ... an ERROR"                 "ERROR source-rule swap incomplete" "$(logtext)"
+
+echo "--- case SF: GL's rule is deleted until a read-back shows it gone, whatever is listed ahead of it"
+# A delete that names no input device takes the FIRST rule in list order matching what it does name
+# (device fact, kernel 5.4 / iproute2 6.3.0, 2026-10-04). A foreign "from <net> iif lo lookup main"
+# listed ahead of GL's rule is therefore deleted first, and a single delete reported as GL's left
+# GL's rule routing guest around priority 5279 until the next pass. Removing the foreign rule on the
+# way is accepted by design: GL's bypass is what must go.
+sf() { reset fixture_mt3000; addrs "br-guest 192.168.160.1/24"; seed "$(iif_rule 192.168.160.0/24 lo)" "$(gl_rule 192.168.160.0/24)"; }
+sf
+_ks_swap_ensure > "$T/out" 2>&1; rc=$?
+is "SF rc 0"                           0 "$rc"
+is "SF GL's rule is gone (the foreign one with it), ours in place" "$(to_rule 192.168.160.0/24)" "$(prio0)"
+is "SF the calls: each delete is read back, and the deletes stop once GL's rule is gone" "-4 -br addr
+-4 rule list priority 0
+-4 rule del priority 0 from 192.168.160.0/24 lookup main
+-4 rule list priority 0
+-4 rule del priority 0 from 192.168.160.0/24 lookup main
+-4 rule list priority 0
+-4 rule add to 192.168.160.0/24 lookup main priority 0" "$(swapcalls)"
+is "SF one log line, and it is true now" \
+    "-t ts-fix ks: source-rule swap: guest 192.168.160.0/24 (deleted GL's from-rule, added the to-rule)" "$(logtext)"
+sf
+ks_main arm > "$T/out" 2>&1; rc=$?
+is "SF through arm: rc 0, GL's rule gone" "0 $(to_rule 192.168.160.0/24)" "$rc $(prio0)"
+echo "  SF2: a GL rule that will not delete: five attempts, each read back, then an ERROR and rc 1"
+reset fixture_mt3000
+addrs "br-guest 192.168.160.1/24"
+seed "$(gl_rule 192.168.160.0/24)"
+IP_DEL_FAIL="-4 rule del priority 0 from 192.168.160.0/24"
+_ks_swap_ensure > "$T/out" 2>&1; rc=$?
+is "SF2 rc 1"                          1 "$rc"
+is "SF2 exactly five deletes"          5 "$(grep -cxF -e '-4 rule del priority 0 from 192.168.160.0/24 lookup main' "$T/ip-calls")"
+is "SF2 ... and six lists: the first, then one after each delete" 6 "$(grep -cxF -e '-4 rule list priority 0' "$T/ip-calls")"
+has "SF2 an ERROR naming the rule and the attempts" \
+    "ERROR source-rule swap incomplete: GL's from-rule for guest 192.168.160.0/24 is still present after 5 deletes" "$(logtext)"
+hasnt "SF2 never 'deleted'"            "deleted GL's" "$(logtext)"
+is "SF2 GL's rule is still there, ours added beside it" "$(gl_rule 192.168.160.0/24)
+$(to_rule 192.168.160.0/24)" "$(prio0)"
+echo "  SF3: the read-back fails after a delete: ERROR, rc 1, never 'deleted'"
+reset fixture_mt3000
+addrs "br-guest 192.168.160.1/24"
+seed "$(iif_rule 192.168.160.0/24 lo)" "$(gl_rule 192.168.160.0/24)"
+IP_READ_FAIL="-4 rule list priority 0"; IP_READ_FAIL_SKIP=1
+_ks_swap_ensure > "$T/out" 2>&1; rc=$?
+is "SF3 rc 1"                          1 "$rc"
+is "SF3 one delete, then the failed read: no second delete" 1 "$(grep -cxF -e '-4 rule del priority 0 from 192.168.160.0/24 lookup main' "$T/ip-calls")"
+has "SF3 an ERROR"                     "GL's from-rule for guest 192.168.160.0/24 could not be confirmed gone" "$(logtext)"
+hasnt "SF3 never 'deleted'"            "deleted GL's" "$(logtext)"
+echo "  SF4: the quiet path is unchanged: GL's rule absent costs one list and no delete"
+reset fixture_mt3000
+addrs "br-guest 192.168.160.1/24"
+seed "$(to_rule 192.168.160.0/24)"
+_ks_swap_ensure > "$T/out" 2>&1; rc=$?
+is "SF4 rc 0, exactly the two reads"   "0 -4 -br addr
+-4 rule list priority 0" "$rc $(swapcalls)"
 
 echo "--- case S12: every rule-layer call site pairs the swap with it"
 s12() { addrs "br-guest 192.168.160.1/24"; seed "$(gl_rule 192.168.160.0/24)"; }
@@ -2742,7 +3534,8 @@ is "S12 arm with no intent undoes it"  "$(gl_rule 192.168.160.0/24):" "$(prio0):
 s12_swapped
 uci set glconfig.general.mode=extender
 ks_main arm > "$T/out" 2>&1; rc=$?
-is "S12 arm refused by the mode undoes it (rc 2)" "2 $(gl_rule 192.168.160.0/24):" "$rc $(prio0):$(marker)"
+# Outside Router mode gl_tailscale exits before adding its source rule: the undo re-adds none (SR9).
+is "S12 arm refused by the mode undoes it (rc 2) and re-adds nothing" "2 :" "$rc $(prio0):$(marker)"
 s12_swapped
 ks_main rules-clean > "$T/out" 2>&1; rc=$?
 is "S12 rules-clean undoes it (rc 0)"  "0 $(gl_rule 192.168.160.0/24):" "$rc $(prio0):$(marker)"
@@ -3065,6 +3858,92 @@ gl_cond guest
 counters_reset
 _ks_swap_restore > "$T/out" 2>&1; rc=$?
 is "SR8e rc 0, zero ip and ipcalc calls, the to-rule kept" "0 ::$(to_rule 192.168.160.0/24)" "$rc $(ipcalls):$(ipcalcs):$(prio0)"
+
+echo "--- case SR9: GL's rule is re-added only on GL's own path: Tailscale enabled, in Router mode"
+# gl_tailscale on GL 4.9.0 and 4.11.0 (read on live routers 2026-10-02): every restart deletes the
+# rules GL tracks, exits unless glconfig.general.mode is exactly 'router', and adds the guest/iot
+# source rules back only inside `if [ "$enabled" = "1" ]`, with an exit node set and the zone's
+# disabled exactly '0'. A copy the undo re-added anywhere else is tracked by nothing: re-added while
+# Tailscale was off, it sat at priority 0 ahead of the slider accessory's transition lockdown on the
+# next turn-on (GL 4.11.0, 2026-10-01). Every variant meets GL's exit-node and zone condition, with
+# guest and iot both swapped and GL's LAN rules beside them, so only the pair under test varies.
+sr9() {   # <label> <tailscale.settings.enabled> <glconfig.general.mode>; "-" = the option absent
+    sr9_l="$1" sr9_en="$2" sr9_md="$3"
+    reset fixture_mt3000
+    addrs "br-lan 192.168.50.1/24" "br-guest 192.168.160.1/24" "br-iot 192.168.10.1/24"
+    seed_gl_lan
+    seed "$(to_rule 192.168.160.0/24)" "$(to_rule 192.168.10.0/24)"
+    printf 'guest 192.168.160.0/24\niot 192.168.10.0/24\n' > "$KS_SWAP_MARK"
+    gl_cond guest iot
+    if [ "$sr9_en" = "-" ]; then uci -q delete tailscale.settings.enabled; else uci set "tailscale.settings.enabled=$sr9_en"; fi
+    if [ "$sr9_md" = "-" ]; then uci -q delete glconfig.general.mode; else uci set "glconfig.general.mode=$sr9_md"; fi
+    counters_reset
+    _ks_swap_restore > "$T/out" 2>&1; rc=$?
+    is "SR9$sr9_l rc 0"                    0 "$rc"
+    if [ -e "$KS_SWAP_MARK" ]; then nok "SR9$sr9_l the marker is gone" "absent" "present"; else ok "SR9$sr9_l the marker is gone"; fi
+}
+sr9_none() {   # the same, where GL would have no rule: the to-rules go, and nothing is re-added
+    sr9 "$1" "$2" "$3"
+    is "SR9$sr9_l ours removed, GL's LAN rules untouched, no from-rule re-added" "$(to_rule 192.168.50.0/24)
+$(to_rule 192.168.200.0/24)" "$(prio0)"
+    is "SR9$sr9_l no rule list for a re-add, and no add at all" "" "$(grep -e 'rule list priority 0' -e ' add ' "$T/ip-calls")"
+    is "SR9$sr9_l the one summary line names the removals only" \
+        "-t ts-fix ks: source-rule swap undone: removed the to-rule for guest 192.168.160.0/24, iot 192.168.10.0/24" "$(logtext)"
+}
+echo "  SR9a: enabled='0', mode 'router' -> nothing re-added"
+sr9_none a 0 router
+echo "  SR9b: enabled absent, mode 'router' -> nothing re-added"
+sr9_none b - router
+echo "  SR9c: enabled='1', mode 'ap' -> nothing re-added"
+sr9_none c 1 ap
+echo "  SR9d: enabled='1', mode absent -> nothing re-added"
+sr9_none d 1 -
+echo "  SR9e: the control: enabled='1', mode 'router' -> both re-added, as before"
+sr9 e 1 router
+is "SR9e ours removed, GL's rules back" "$(to_rule 192.168.50.0/24)
+$(to_rule 192.168.200.0/24)
+$(gl_rule 192.168.160.0/24)
+$(gl_rule 192.168.10.0/24)" "$(prio0)"
+is "SR9e the one summary line names the removals and the re-adds" \
+    "-t ts-fix ks: source-rule swap undone: removed the to-rule for guest 192.168.160.0/24, iot 192.168.10.0/24; re-added GL's from-rule for guest 192.168.160.0/24, iot 192.168.10.0/24" "$(logtext)"
+is "SR9e enabled, mode and exit_node_ip each read exactly once by the undo" "1 1 1" \
+    "$(grep -cxF 'uci -q get tailscale.settings.enabled' "$T/uci-calls") $(grep -cxF 'uci -q get glconfig.general.mode' "$T/uci-calls") $(grep -cxF 'uci -q get tailscale.settings.exit_node_ip' "$T/uci-calls")"
+echo "  SR9f: the public paths with Tailscale disabled: disarm (the teardown) and the disarmed poll"
+s6_arm
+gl_cond guest iot
+uci set tailscale.settings.enabled=0
+is "SR9f disarm non-vacuity: both swapped and recorded" "$(to_rule 192.168.50.0/24)
+$(to_rule 192.168.200.0/24)
+$(to_rule 192.168.160.0/24)
+$(to_rule 192.168.10.0/24):guest 192.168.160.0/24
+iot 192.168.10.0/24" "$(prio0):$(marker)"
+counters_reset
+ks_main disarm > "$T/out" 2>&1; rc=$?
+is "SR9f disarm rc 0"                  0 "$rc"
+is "SR9f disarm: ours removed, GL's LAN rules untouched, no from-rule re-added" "$(to_rule 192.168.50.0/24)
+$(to_rule 192.168.200.0/24)" "$(prio0)"
+is "SR9f disarm: no add issued"        "" "$(grep -e ' add ' "$T/ip-calls")"
+if [ -e "$KS_SWAP_MARK" ]; then nok "SR9f disarm: the marker is gone" "absent" "present"; else ok "SR9f disarm: the marker is gone"; fi
+is "SR9f disarm: the one swap line names the removals only" \
+    "-t ts-fix ks: source-rule swap undone: removed the to-rule for guest 192.168.160.0/24, iot 192.168.10.0/24" \
+    "$(grep -e 'source-rule swap' "$T/log")"
+reset fixture_mt3000
+uci set tailscale.settings.enabled=0                # the toggle stays on; Tailscale is what is off
+addrs "br-lan 192.168.50.1/24" "br-guest 192.168.160.1/24" "br-iot 192.168.10.1/24"
+seed_gl_lan
+seed "$(to_rule 192.168.160.0/24)" "$(to_rule 192.168.10.0/24)"   # a swap left behind; no rule layer
+printf 'guest 192.168.160.0/24\niot 192.168.10.0/24\n' > "$KS_SWAP_MARK"
+gl_cond guest iot
+counters_reset
+ks_main check > "$T/out" 2>&1; rc=$?
+is "SR9f check rc 0"                   0 "$rc"
+is "SR9f check: the disarmed branch, its 5279 probe first" "-4 rule list priority 5279" "$(head -n 1 "$T/ip-calls")"
+is "SR9f check: ours removed, GL's LAN rules untouched, no from-rule re-added" "$(to_rule 192.168.50.0/24)
+$(to_rule 192.168.200.0/24)" "$(prio0)"
+is "SR9f check: no add issued"         "" "$(grep -e ' add ' "$T/ip-calls")"
+if [ -e "$KS_SWAP_MARK" ]; then nok "SR9f check: the marker is gone" "absent" "present"; else ok "SR9f check: the marker is gone"; fi
+is "SR9f check: exactly one log line, the stale-swap summary naming the removals only" \
+    "-t ts-fix ks: source-rule swap found with no armed intent - undone: removed the to-rule for guest 192.168.160.0/24, iot 192.168.10.0/24" "$(logtext)"
 
 echo "--- case SI: the swap's parsers leave the caller's IFS as they found it"
 reset fixture_mt3000
@@ -3652,15 +4531,17 @@ done
 echo "--- case 17: ks_main serializes invokers on the engine's own lock"
 # The lock lives in ks_main, which only the executed path reaches, so this case runs the script as
 # a separate process against throwaway PATH stubs (every external the engine could touch is stubbed
-# to fail, so the run takes the disarmed path — its sidecar read and its one rule probe both hit
-# failing stubs — having written nothing, and no real uci/ip/logger is ever invoked). No pgrep is
-# used anywhere in this harness, so there is no self-match pattern to bracket.
+# to fail, except that uci answers the intent's two section reads with a readable section and no
+# kill_switch option, so the run takes the disarmed path — its sidecar read and its one rule probe
+# both hit failing stubs — having written nothing, and no real uci/ip/logger is ever invoked). No
+# pgrep is used anywhere in this harness, so there is no self-match pattern to bracket.
 #
-# The process runs a COPY of the engine under $T whose KS_LOCK, KS_SWAP_MARK and KS_IPCALC lines
-# are rewritten to paths inside $T — the ipcalc one to the harness's fake — and which is the
-# shipping engine byte for byte everywhere else; the lint below asserts both. The production lock
-# and marker are therefore never touched, and another run of this suite on the same host cannot
-# contend with these cases.
+# The process runs a COPY of the engine under $T whose KS_LOCK, KS_SWAP_MARK, KS_IPCALC,
+# KS_INTENTWARN and KS_RELOAD_FAIL lines are rewritten to paths inside $T — the ipcalc one to the
+# harness's fake — and which is the shipping engine byte for byte everywhere else; the lint below
+# asserts both. The production lock, marker and tmpfs flags are therefore never touched (the two
+# flags are tested, and one removed, on every disarmed pass), and another run of this suite on the
+# same host cannot contend with these cases.
 #
 # The child shell is pinned to /bin/sh rather than "whatever sh means to the shell running this
 # suite": BusyBox ash runs sh, ip and logger as its own applets without a PATH lookup, so under it
@@ -3679,8 +4560,10 @@ case "$T" in *[!A-Za-z0-9._/-]*) child_ok=no ;; esac
 is "17 \$T is safe inside a sed replacement and a shell assignment (instrument lint)" yes "$child_ok"
 sed -e "s|^KS_LOCK=.*|KS_LOCK=\"$CHILD_LOCK\"|" \
     -e "s|^KS_SWAP_MARK=.*|KS_SWAP_MARK=\"$CHILD/ts-fix-ks.srcswap\"|" \
-    -e "s|^KS_IPCALC=.*|KS_IPCALC=\"$KS_IPCALC\"|" "$SRC" > "$CHILD_SRC"
-for v in KS_LOCK KS_SWAP_MARK KS_IPCALC; do
+    -e "s|^KS_IPCALC=.*|KS_IPCALC=\"$KS_IPCALC\"|" \
+    -e "s|^KS_INTENTWARN=.*|KS_INTENTWARN=\"$CHILD/ts-fix-ks.intentwarn\"|" \
+    -e "s|^KS_RELOAD_FAIL=.*|KS_RELOAD_FAIL=\"$CHILD/ts-fix-ks.reload-failed\"|" "$SRC" > "$CHILD_SRC"
+for v in KS_LOCK KS_SWAP_MARK KS_IPCALC KS_INTENTWARN KS_RELOAD_FAIL; do
     line=$(grep -e "^$v=" "$CHILD_SRC")
     case "$line" in
         "$v=\"$T/"*) ok "17 the copy's $v line points into \$T" ;;
@@ -3691,16 +4574,23 @@ for v in KS_LOCK KS_SWAP_MARK KS_IPCALC; do
             ;;
     esac
 done
-want=$(grep -n -e '^KS_LOCK=' -e '^KS_SWAP_MARK=' -e '^KS_IPCALC=' "$SRC" | cut -d: -f1)
+want=$(grep -n -e '^KS_LOCK=' -e '^KS_SWAP_MARK=' -e '^KS_IPCALC=' -e '^KS_INTENTWARN=' -e '^KS_RELOAD_FAIL=' "$SRC" | cut -d: -f1)
 got=$(command awk 'NR == FNR { a[FNR] = $0; n = FNR; next } a[FNR] != $0 { print FNR } END { if (FNR != n) print "length" }' "$SRC" "$CHILD_SRC")
 is "17 the copy differs from the engine on exactly those lines" "$want" "$got"
-is "17 ... which are three, one definition each" 3 "$(printf '%s\n' "$want" | grep -c .)"
+is "17 ... which are five, one definition each" 5 "$(printf '%s\n' "$want" | grep -c .)"
 [ "$want" = "$got" ] || child_ok=no
 mkdir -p "$T/bin"
 for stub in uci ip ubus jsonfilter logger; do
     printf '#!/bin/sh\nexit 1\n' > "$T/bin/$stub"
     chmod +x "$T/bin/$stub"
 done
+cat > "$T/bin/uci" <<'EOF'
+#!/bin/sh
+case "$*" in
+    "-q show ts-fix.settings"|"-q show tailscale.settings") echo "${3}=settings" ;;
+    *) exit 1 ;;
+esac
+EOF
 ENGINE_SH=/bin/sh
 stubs_ok=yes
 for stub in uci ip ubus jsonfilter logger; do
@@ -3744,7 +4634,8 @@ mkdir -p "$T/bin2"
 cat > "$T/bin2/uci" <<'EOF'
 #!/bin/sh
 case "$*" in
-    *ts-fix.settings.kill_switch*|*tailscale.settings.enabled*) echo 1 ;;
+    "-q show ts-fix.settings") printf "ts-fix.settings=settings\nts-fix.settings.kill_switch='1'\n" ;;
+    "-q show tailscale.settings") printf "tailscale.settings=settings\ntailscale.settings.enabled='1'\n" ;;
     *glconfig.general.mode*) echo router ;;
     *) exit 1 ;;
 esac

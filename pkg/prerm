@@ -36,16 +36,23 @@ cp /etc/config/ts-fix /tmp/ts-fix-config.saved 2>/dev/null
 # ("finding 43", 2026-08-21): netifd fired a late wan6 DHCPv6 ifup mid-removal, the
 # still-installed iface hotplug spawned a reapply, and the converge re-armed from the
 # still-present config AFTER teardown — stranding enforcement with no engine. ts-fix has FIVE
-# writers to neutralize, in spawn-source order, BEFORE the teardown below runs:
+# writers to neutralize, in spawn-source order, BEFORE the teardown below runs (a sixth, the
+# ts-fix-isolate6 sync, is serialized by postrm instead; see item 1):
 #
 #   1. hotplug handlers — netifd runs them on its own schedule: 20-ts-fix spawns a reapply on any
-#      ifup (or ANY event while Tailscale is disabled), and 10-ts-fix-ks runs the engine's
+#      ifup (or ANY event while Tailscale is disabled), 10-ts-fix-ks runs the engine's
 #      lock-free rules-ensure on any non-loopback ifup, which re-installs the rule layer for as
 #      long as the intent UCI still reads armed — and that UCI is only deleted at the end of this
-#      script, after the disarm has removed the rules. Both are our own files and opkg deletes
-#      them right after this script anyway; deleting them FIRST means no iface event inside the
-#      removal window can ever birth a writer. Upgrades keep them via the PKG_UPGRADE guard above.
-rm -f /etc/hotplug.d/iface/20-ts-fix /etc/hotplug.d/iface/10-ts-fix-ks 2>/dev/null
+#      script, after the disarm has removed the rules — and 98-ts-fix-isolate6 starts a delayed,
+#      detached ts-fix-isolate6 sync on uplink events, which writes and commits IPv6 isolate rules.
+#      All three are our own files and opkg deletes them right after this script anyway; deleting
+#      them FIRST means no iface event inside the removal window can ever birth a writer. Upgrades
+#      keep them via the PKG_UPGRADE guard above. An isolate6 sync already under way (from this
+#      handler, the watchdog's backstop or postinst) is not drained here: postrm holds its lock
+#      while it deletes the IPv6 rules, and a sync that gets the lock once opkg has deleted the
+#      script does nothing.
+rm -f /etc/hotplug.d/iface/20-ts-fix /etc/hotplug.d/iface/10-ts-fix-ks \
+      /etc/hotplug.d/iface/98-ts-fix-isolate6 2>/dev/null
 
 #   2. boot guard — KILLED BEFORE the service stop below, for two reasons. First, it is a
 #      DETACHED orphan subshell (procd does not track it; a stop cannot reach it) that

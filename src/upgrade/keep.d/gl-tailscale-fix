@@ -13,10 +13,12 @@
 /etc/init.d/ts-fix-preboot
 /etc/hotplug.d/iface/10-ts-fix-ks
 /etc/hotplug.d/iface/20-ts-fix
+/etc/hotplug.d/iface/98-ts-fix-isolate6
 /usr/bin/ts-fix-ks
 /usr/bin/ts-fix-reapply
 /usr/bin/ts-fix-watchdog
 /usr/bin/ts-fix-update
+/usr/bin/ts-fix-isolate6
 /etc/nginx/gl-conf.d/ts-fix.conf
 /usr/share/ts-fix/
 
@@ -35,6 +37,8 @@
 # the boot the preboot pass exists for, and without the link it would not run on it.
 /etc/rc.d/S18ts-fix-preboot
 
-# Tailscale binaries (preserved if updated via Version Manager)
-/usr/sbin/tailscaled
-/usr/sbin/tailscale
+# The Tailscale binaries (/usr/sbin/tailscaled, /usr/sbin/tailscale) are NOT listed here. When the
+# Version Manager installs a binary, /usr/bin/ts-fix-update writes a second list naming them,
+# /lib/upgrade/keep.d/gl-tailscale-fix-tailscale, and Restore deletes it. A firmware upgrade that
+# keeps settings copies every listed path that exists, so listing them here carried the old
+# firmware's own Tailscale over the new firmware's (measured on a 4.8.5 → 4.9.0 upgrade).
