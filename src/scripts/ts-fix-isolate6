@@ -1,0 +1,526 @@
+#!/bin/sh
+# gl-tailscale-fix: the IPv6 half of GL's "Block WAN Subnets".
+#
+# GL's "Block WAN Subnets" toggle (gl-black_white_list.<net>.wan_isolate) keeps a network - guest,
+# and on newer firmware iot and custom VLANs - from reaching the network the router is connected
+# through: a hotel or office LAN, the upstream router's admin page. GL builds it as one firewall
+# rule per uplink and network, named <uplink>_<net>_isolate, that REJECTs the network's forwarded
+# traffic to the uplink's IPv4 subnet. Those rules are IPv4 only, so the same devices still reach
+# the upstream network over IPv6: on GL 4.9.0 a guest client did exactly that (2026-10-03).
+#
+# This script adds the rule GL leaves out. For every IPv4 isolate rule GL has in place it keeps one
+# rule, ts_fix_<uplink>_<net>_isolate6, that REJECTs <net>'s forwarded IPv6 to the uplink's on-link
+# IPv6 prefixes. Whether to isolate an uplink at all is GL's decision - GL deletes its rule when the
+# uplink's subnet is public or the uplink has no IPv4 - and this follows it rather than making its
+# own: no GL rule (or a disabled one), no IPv6 rule. An uplink whose status or routes cannot be read
+# is left as it is, rule or no rule, until a sync reads it: only a read that succeeds and finds no
+# device or no prefix removes a rule. It is independent of Tailscale and of the kill switch: it
+# completes a GL feature, and runs whether or not either is on.
+#
+#   ts-fix-isolate6 sync     converge our rules on GL's. Prints nothing; rc 0, or 1 after an ERROR
+#                            it logged or an uplink it could not read (a WARNING). Commits and
+#                            reloads the firewall only on a change.
+#   ts-fix-isolate6 remove   delete every ts_fix_*_isolate6 rule.
+#
+# Callers: /etc/hotplug.d/iface/98-ts-fix-isolate6 on uplink events, the watchdog about every 30 s,
+# and pkg/postinst once. pkg/postrm deletes the rules with inline uci on removal, holding this
+# script's lock (this script is gone by then, and a sync that gets the lock after that does
+# nothing). Everything read from uci, ubus or ip is validated before it reaches a uci, ubus or ip
+# argument; a value that fails is skipped and logged as an ERROR.
+# Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
+# https://github.com/RemoteToHome-io/gl-tailscale-fix
+
+# Section and prefix lists are word-split unquoted below, and a rule's dest is a literal '*'.
+# Pathname expansion is never wanted here.
+set -f
+
+TS_FIX_FW_INIT=${TS_FIX_FW_INIT:-/etc/init.d/firewall}
+ISO6_LOCK=${ISO6_LOCK:-/tmp/ts-fix-isolate6.lock}
+
+# A commit that fails leaves the change staged in /tmp/.uci, and `uci show` reads staged changes
+# back: every later sync would find its rules already in place and never commit or reload them.
+# This flag, in tmpfs like the staged delta it stands for, makes the next sync commit and reload.
+ISO6_COMMIT_FAIL=${ISO6_COMMIT_FAIL:-/tmp/ts-fix-isolate6.commit-failed}
+
+# A reload that fails after a good commit leaves the rules in flash but not in the running firewall,
+# and every later sync would find them in place and never reload. This flag makes the next sync
+# reload (with no commit when nothing is staged) until a reload succeeds.
+ISO6_RELOAD_FAIL=${ISO6_RELOAD_FAIL:-/tmp/ts-fix-isolate6.reload-failed}
+
+# iso6_gl_pairs: GL's own IPv4 isolate rules, from `uci -q show firewall` on stdin; prints
+# "<uplink> <net>" per rule, sorted. A section counts when it is of type rule, its name ends in
+# _<src>_isolate where <src> is its own src option, its target is REJECT, its dest_ip is one IPv4
+# NET/PFX and it is not disabled. <uplink> is what is left of the name, so an uplink that contains
+# underscores (modem_1_1_4) parses whole. Every name printed is [A-Za-z0-9_] only. Our own sections
+# end in _isolate6 and never match.
+iso6_gl_pairs() {
+    awk -v q="'" '
+    /^firewall\.[A-Za-z0-9_]+=rule$/ { s = substr($0, 10, length($0) - 14); isrule[s] = 1; next }
+    /^firewall\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+=/ {
+        rest = substr($0, 10); d = index(rest, "."); s = substr(rest, 1, d - 1)
+        r2 = substr(rest, d + 1); e = index(r2, "="); o = substr(r2, 1, e - 1); v = substr(r2, e + 1)
+        gsub(q, "", v); opt[s SUBSEP o] = v
+    }
+    END {
+        for (s in isrule) {
+            if (s ~ /^ts_fix_/) continue
+            src = opt[s SUBSEP "src"]
+            if (src !~ /^[A-Za-z0-9_]+$/) continue
+            suf = "_" src "_isolate"; n = length(s); m = length(suf)
+            if (n <= m || substr(s, n - m + 1) != suf) continue
+            if (opt[s SUBSEP "target"] != "REJECT") continue
+            en = opt[s SUBSEP "enabled"]
+            if (en == "0" || en == "false" || en == "off" || en == "no") continue
+            if (opt[s SUBSEP "dest_ip"] !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/) continue
+            up = substr(s, 1, n - m)
+            if (up !~ /^[A-Za-z0-9_]+$/) continue
+            print up, src
+        }
+    }' | LC_ALL=C sort
+}
+
+# iso6_route_prefixes: the on-link IPv6 prefixes of one device, from `ip -6 route show dev <dev>`
+# on stdin; prints them lower-case, sorted, unique. On-link: a destination with a prefix length and
+# no gateway - neither "via" on its line nor "nexthop" lines after it (a multipath route). A route
+# through a gateway is not the uplink's own subnet, which is what GL's IPv4 rule names, and its
+# width is whatever the upstream announces. Skipped as well: host routes (no "/"), /0 and /128,
+# link-local fe80::/10 and multicast ff00::/8; default, unreachable, blackhole and the other route
+# types start with a keyword, not a prefix, and fall to the "/" test. What is printed is a
+# candidate: the caller checks each one against the IPv6 prefix charset before it reaches uci.
+iso6_route_prefixes() {
+    awk '
+    $1 == "nexthop" { cand = ""; next }
+    { if (cand != "") print cand; cand = "" }
+    index($1, "/") == 0 { next }
+    {
+        p = tolower($1); split(p, a, "/")
+        if (p ~ /^fe[89ab][0-9a-f]:/ || p ~ /^ff[0-9a-f][0-9a-f]:/) next
+        if (a[2] == "0" || a[2] == "128") next
+        gw = 0
+        for (i = 2; i <= NF; i++) if ($i == "via") gw = 1
+        if (!gw) cand = p
+    }
+    END { if (cand != "") print cand }' | LC_ALL=C sort -u
+}
+
+# iso6_ours: our rules, from `uci -q show firewall` on stdin; prints "<section> <dest_ip>" per
+# ts_fix_*_isolate6 section of type rule, the list space-joined as uci prints it with the quotes
+# dropped (the section name alone when it has none), sorted.
+iso6_ours() {
+    awk -v q="'" '
+    {
+        eq = index($0, "=")
+        if (eq == 0) next
+        key = substr($0, 1, eq - 1); val = substr($0, eq + 1)
+    }
+    key ~ /^firewall\.ts_fix_[A-Za-z0-9_]+_isolate6$/ && val == "rule" { ours[substr(key, 10)] = 1; next }
+    key ~ /^firewall\.ts_fix_[A-Za-z0-9_]+_isolate6\.dest_ip$/ {
+        gsub(q, "", val); dip[substr(key, 10, length(key) - 17)] = val
+    }
+    END { for (s in ours) { if (dip[s] == "") print s; else print s, dip[s] } }' | LC_ALL=C sort
+}
+
+# iso6_render: our rules as sync compares them, from `uci -q show firewall` on stdin. One line per
+# ts_fix_*_isolate6 section of type rule, sorted: the section name, then every option we own in a
+# fixed order - enabled src dest family proto target name dest_ip - tab-separated, each as
+# "<option>=<value>" with the quotes dropped (a list space-joined), or as the bare option name when
+# it is absent. sync renders the rule it wants the same way, from the uci show text it would leave
+# (_iso6_want_show), and rewrites a rule whose line differs in anything: its dest_ip list, an
+# enabled option of any value (another writer's commit can land while a write has it at '0'), or
+# any other option changed or lost.
+iso6_render() {
+    awk -v q="'" '
+    BEGIN { nk = split("enabled src dest family proto target name dest_ip", ks, " ") }
+    {
+        eq = index($0, "=")
+        if (eq == 0) next
+        key = substr($0, 1, eq - 1); val = substr($0, eq + 1)
+    }
+    key ~ /^firewall\.ts_fix_[A-Za-z0-9_]+_isolate6$/ { if (val == "rule") ours[substr(key, 10)] = 1; next }
+    key ~ /^firewall\.ts_fix_[A-Za-z0-9_]+_isolate6\.[A-Za-z0-9_]+$/ {
+        rest = substr(key, 10); d = index(rest, ".")
+        s = substr(rest, 1, d - 1); o = substr(rest, d + 1)
+        gsub(q, "", val); v[s SUBSEP o] = val; has[s SUBSEP o] = 1
+    }
+    END {
+        for (s in ours) {
+            line = s
+            for (i = 1; i <= nk; i++) {
+                if (has[s SUBSEP ks[i]] == 1) line = line "\t" ks[i] "=" v[s SUBSEP ks[i]]
+                else line = line "\t" ks[i]
+            }
+            print line
+        }
+    }' | LC_ALL=C sort
+}
+
+# _iso6_want_show <section> <net> <uplink> <prefix>...: the rule _iso6_write leaves, as `uci show`
+# prints it. The two must agree option for option: a difference would show up as a rule that never
+# converges, rewritten and logged as updated on every sync (the unit test's quiet second sync).
+_iso6_want_show() {
+    local k="firewall.$1" net="$2" up="$3" l="" p
+    shift 3
+    for p in "$@"; do l="$l '$p'"; done
+    printf '%s\n' "$k=rule" "$k.src='$net'" "$k.dest='*'" "$k.family='ipv6'" "$k.proto='all'" \
+        "$k.target='REJECT'" "$k.name='ts-fix: isolate $net and $up (IPv6)'" "$k.dest_ip=${l# }"
+}
+
+# The validators. Each value is checked where it is about to become a uci, ubus or ip argument.
+_iso6_name_ok() {   # a uci name: [A-Za-z0-9_], not empty
+    case "$1" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+    return 0
+}
+_iso6_dev_ok() {    # a network device name as netifd reports one
+    case "$1" in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; esac
+    return 0
+}
+_iso6_prefix_ok() { # a lower-case IPv6 prefix: hex digits and colons, one "/", a length of 1-127
+    case "$1" in */*/*|*[!0-9a-f:/]*) return 1 ;; */*) ;; *) return 1 ;; esac
+    case "${1%/*}" in *:*) ;; *) return 1 ;; esac
+    case "${1#*/}" in [1-9]|[1-9][0-9]|1[01][0-9]|12[0-7]) return 0 ;; esac
+    return 1
+}
+
+# _iso6_line_of <section> "<iso6_render output>" -> that section's line; rc 1 when it has none.
+_iso6_line_of() {
+    printf '%s\n' "$2" | awk -v s="$1" '$1 == s { print; f = 1 } END { exit !f }'
+}
+
+# _iso6_write create|update <section> <net> <uplink> <prefix>... -> rc 0; 1 after a failed write;
+# 2 when the rule did not read back as written (deleted, one ERROR). Every other writer of the
+# firewall config (GL's own isolate updater, the kill-switch engine) commits whatever is staged,
+# and uci's lost update - a write appended between another writer's commit loading the shared delta
+# and deleting it is gone, with rc 0 - can drop any one of ours. So every option is written with
+# the rule disabled, the section is read back, and it is enabled only when it reads back exactly as
+# wanted with enabled '0': a commit of theirs must find a disabled rule or a whole one, never a live
+# rule with an option missing. Without its dest_ip it would REJECT all of the network's forwarded
+# IPv6; without its src, fw3 puts a rule with dest set in OUTPUT (upstream rules.c), where it would
+# REJECT the router's own IPv6 to the uplink's prefixes. A rule that does not read back is written
+# once more, still disabled (created again if the section itself is gone), and re-checked; if it
+# still differs it is deleted. A create deletes any section already holding the name (by type it is
+# not one of ours, or it would be an update). A write that fails deletes the section: a missing
+# rule is retried on the next sync, a half-written one would stand. Two windows remain: between the
+# section's creation and its enabled=0 a concurrent commit finds an empty rule (two consecutive uci
+# calls wide), and a commit already in flight across the verifying read can still lose a write that
+# read showed, or the enable. Either leaves at worst a disabled rule or a briefly live one, which
+# the rest of the write and the read-back in iso6_sync repair before our commit.
+_iso6_failed=0
+_iso6_uci() { uci "$@" || _iso6_failed=1; }
+_iso6_write() {
+    local how="$1" sec="$2" net="$3" up="$4" k="firewall.$2" p seen="$_iso6_show" off cur pass=1
+    shift 4
+    # The rule as it must read back before it is enabled: as wanted, plus enabled '0'.
+    off=$({ _iso6_want_show "$sec" "$net" "$up" "$@"; printf '%s\n' "$k.enabled='0'"; } | iso6_render)
+    while :; do
+        _iso6_failed=0
+        if [ "$how" = "create" ]; then
+            if printf '%s\n' "$seen" | grep -q -e "^firewall\.$sec="; then
+                uci -q delete "$k"
+            fi
+            _iso6_uci set "$k=rule"
+        fi
+        _iso6_uci set "$k.enabled=0"
+        _iso6_uci set "$k.src=$net"
+        _iso6_uci set "$k.dest=*"
+        _iso6_uci set "$k.family=ipv6"
+        _iso6_uci set "$k.proto=all"
+        _iso6_uci set "$k.target=REJECT"
+        _iso6_uci set "$k.name=ts-fix: isolate $net and $up (IPv6)"
+        [ "$how" = "update" ] && uci -q delete "$k.dest_ip"
+        for p in "$@"; do
+            _iso6_uci add_list "$k.dest_ip=$p"
+        done
+        [ "$_iso6_failed" = "0" ] || break
+        seen=$(uci -q show firewall 2>/dev/null)
+        cur=$(printf '%s\n' "$seen" | iso6_render)
+        if [ "$(_iso6_line_of "$sec" "$cur")" = "$off" ]; then
+            _iso6_uci -q delete "$k.enabled"
+            [ "$_iso6_failed" = "0" ] && return 0
+            break
+        fi
+        if [ "$pass" = "2" ]; then
+            uci -q delete "$k"
+            logger -t ts-fix "isolate6: ERROR $sec did not read back as written (another writer committed mid-write) - removed; retrying on the next sync"
+            return 2
+        fi
+        pass=2
+        how=create
+        _iso6_line_of "$sec" "$cur" >/dev/null && how=update
+    done
+    uci -q delete "$k"
+    logger -t ts-fix "isolate6: ERROR a uci write for $sec failed - removed rather than left half-written (another writer committed the firewall config mid-write, or the overlay is full/read-only); retrying on the next sync"
+    return 1
+}
+
+# _iso6_finish "<what changed>" -> commit and reload when something changed, or when an earlier
+# commit failed (ISO6_COMMIT_FAIL); only reload when nothing changed but an earlier reload failed
+# (ISO6_RELOAD_FAIL); then one log line. rc 1 when the commit fails - nothing is then reloaded,
+# since the firewall would apply a config that is not in flash - or when the reload fails. `9>&-`
+# keeps the lock fd out of anything the firewall's init script leaves running.
+_iso6_finish() {
+    local msg="$1" what="$1" commit=1
+    if [ -z "$msg" ]; then
+        if [ -f "$ISO6_COMMIT_FAIL" ]; then
+            msg="committed what an earlier sync staged"
+            what=$msg
+        elif [ -f "$ISO6_RELOAD_FAIL" ]; then
+            msg="reloaded the firewall for what an earlier sync committed"
+            what="retry for what an earlier sync committed"
+            commit=0
+        else
+            return 0
+        fi
+    fi
+    if [ "$commit" = "1" ] && ! uci commit firewall; then
+        # touch, not `: > file`: a failed redirection on a special built-in ends the whole script in
+        # dash and BusyBox ash, and storage may be full at exactly this moment.
+        touch "$ISO6_COMMIT_FAIL" 2>/dev/null
+        logger -t ts-fix "isolate6: ERROR uci commit firewall failed ($msg) - not persisted, firewall not reloaded (full or read-only overlay?); retrying on the next sync"
+        return 1
+    fi
+    rm -f "$ISO6_COMMIT_FAIL"
+    if ! "$TS_FIX_FW_INIT" reload >/dev/null 2>&1 9>&-; then
+        touch "$ISO6_RELOAD_FAIL" 2>/dev/null
+        logger -t ts-fix "isolate6: ERROR firewall reload failed ($what) - rules committed but not applied; retrying on the next sync"
+        return 1
+    fi
+    rm -f "$ISO6_RELOAD_FAIL"
+    logger -t ts-fix "isolate6: $msg"
+    return 0
+}
+
+# _iso6_unread <uplink> "<what failed>": the WARNING for an uplink whose status or routes could not
+# be read. The caller leaves that pair's rule as it is and sets rc 1.
+_iso6_unread() {
+    logger -t ts-fix "isolate6: WARNING could not read uplink $1 ($2) - its IPv6 isolate rule left as it is; retrying on the next sync"
+}
+
+_iso6_show=""
+
+iso6_sync() {
+    local pairs up net st jrc dev rt p pfx sec want="" keep="" have wantr ours line cur rc=0 added=""
+    local updated="" removed="" msg="" wrote="" how again
+    _iso6_show=$(uci -q show firewall 2>/dev/null)
+    if [ -z "$_iso6_show" ]; then
+        logger -t ts-fix "isolate6: ERROR could not read the firewall config - nothing checked or changed"
+        return 1
+    fi
+
+    # What GL's rules call for: one line "<section> <net> <uplink> <prefix>..." per section to have.
+    # The uplink's device is read from its netifd status (l3_device, else device) and its prefixes
+    # from that device's IPv6 routes. A read that FAILS - ubus exits non-zero, jsonfilter cannot
+    # parse the status (it exits 126 then, and 1 for a field that is absent), ip exits non-zero -
+    # says nothing about the uplink: the pair's section goes on the keep list, neither rewritten nor
+    # removed below, one WARNING, rc 1, and the next sync reads again. A read that SUCCEEDS and
+    # finds no device (the interface is down; GL drops its own rule then too) or no on-link prefix
+    # is an absence: no want line, and the pair's section, if any, is removed below.
+    pairs=$(printf '%s\n' "$_iso6_show" | iso6_gl_pairs)
+    set -- $pairs
+    while [ "$#" -ge 2 ]; do
+        up=$1; net=$2
+        shift 2
+        if ! _iso6_name_ok "$up" || ! _iso6_name_ok "$net"; then
+            logger -t ts-fix "isolate6: ERROR GL isolate rule for network '$net' on uplink '$up': a name outside [A-Za-z0-9_] - skipped"
+            rc=1
+            continue
+        fi
+        sec="ts_fix_${up}_${net}_isolate6"
+        st=$(ubus call "network.interface.$up" status 2>/dev/null) || {
+            _iso6_unread "$up" "ubus status rc $?"
+            keep="$keep $sec"
+            rc=1
+            continue
+        }
+        dev=$(printf '%s\n' "$st" | jsonfilter -e '@.l3_device' 2>/dev/null)
+        jrc=$?
+        if [ "$jrc" = "1" ]; then
+            dev=$(printf '%s\n' "$st" | jsonfilter -e '@.device' 2>/dev/null)
+            jrc=$?
+        fi
+        case "$jrc" in
+            0|1) ;;
+            *)
+                _iso6_unread "$up" "jsonfilter rc $jrc on its status"
+                keep="$keep $sec"
+                rc=1
+                continue
+                ;;
+        esac
+        [ -n "$dev" ] || continue
+        if ! _iso6_dev_ok "$dev"; then
+            logger -t ts-fix "isolate6: ERROR uplink $up reports device '$dev', not a valid device name - $net is not isolated over IPv6"
+            rc=1
+            continue
+        fi
+        rt=$(ip -6 route show dev "$dev" 2>/dev/null) || {
+            _iso6_unread "$up" "ip -6 route show dev $dev rc $?"
+            keep="$keep $sec"
+            rc=1
+            continue
+        }
+        pfx=""
+        for p in $(printf '%s\n' "$rt" | iso6_route_prefixes); do
+            if _iso6_prefix_ok "$p"; then
+                pfx="$pfx $p"
+            else
+                logger -t ts-fix "isolate6: ERROR uplink $up ($dev): route destination '$p' is not an IPv6 prefix - skipped"
+                rc=1
+            fi
+        done
+        [ -n "$pfx" ] && want="${want}$sec $net $up$pfx
+"
+    done
+
+    # What is in place, then the difference. Each rule of ours and each rule wanted is rendered by
+    # iso6_render - every option we own, the dest_ip list in the order it was written (sorted) - and
+    # a rule is rewritten when the two lines differ at all. Equal lines write nothing.
+    have=$(printf '%s\n' "$_iso6_show" | iso6_render)
+    wantr=$(printf '%s\n' "$want" | while read -r sec net up pfx; do
+        [ -z "$sec" ] || _iso6_want_show "$sec" "$net" "$up" $pfx
+    done | iso6_render)
+    ours=$(printf '%s\n' "$have" | awk '{ print $1 }')
+    while read -r sec net up pfx; do
+        [ -n "$sec" ] || continue
+        how=create
+        if cur=$(_iso6_line_of "$sec" "$have"); then
+            [ "$cur" = "$(_iso6_line_of "$sec" "$wantr")" ] && continue
+            how=update
+        fi
+        if _iso6_write "$how" "$sec" "$net" "$up" $pfx; then
+            wrote="$wrote$sec $how $net $up $pfx
+"
+        else
+            # rc 2, a rule that did not read back, is counted as removed even when it was a create,
+            # so the commit also takes it out of flash should another writer's commit have put it
+            # there - the same as the read-back below does.
+            if [ "$?" = "2" ] || [ "$how" = "update" ]; then removed="$removed $sec"; fi
+            rc=1
+        fi
+    done <<EOF
+$want
+EOF
+    while read -r sec line; do
+        [ -n "$sec" ] || continue
+        # Wanted when a line of $want starts with it (the newline in front anchors the match).
+        case "
+$want" in *"
+$sec "*) continue ;; esac
+        # Its uplink could not be read this pass: left as it is.
+        case " $keep " in *" $sec "*) continue ;; esac
+        if ! _iso6_name_ok "$sec"; then
+            logger -t ts-fix "isolate6: ERROR section name '$sec' outside [A-Za-z0-9_] - not deleted"
+            rc=1
+        elif uci -q delete "firewall.$sec"; then
+            removed="$removed $sec"
+        else
+            logger -t ts-fix "isolate6: ERROR could not delete $sec - retrying on the next sync"
+            rc=1
+        fi
+    done <<EOF
+$ours
+EOF
+
+    # Read back every rule written in this pass before anything is committed. _iso6_write enabled
+    # each one only after it read back whole while disabled; this read checks the enable itself and
+    # anything a commit already in flight across that read took away: uci's lost update can drop the
+    # enable (the rule then reads back disabled - fail-closed - and is rewritten here) as well as
+    # any write the earlier read showed. A rule that does not read back as wanted is written once
+    # more (created again if the section itself is gone) and re-checked; if it still differs it is
+    # deleted and counted as removed, so the commit below also takes it out of flash should another
+    # writer's commit have put it there. Nothing written, nothing read back.
+    if [ -n "$wrote" ]; then
+        _iso6_show=$(uci -q show firewall 2>/dev/null)
+        have=$(printf '%s\n' "$_iso6_show" | iso6_render)
+        while read -r sec how net up pfx; do
+            [ -n "$sec" ] || continue
+            line=$(_iso6_line_of "$sec" "$wantr")
+            if [ "$(_iso6_line_of "$sec" "$have")" != "$line" ]; then
+                again=create
+                _iso6_line_of "$sec" "$have" >/dev/null && again=update
+                if ! _iso6_write "$again" "$sec" "$net" "$up" $pfx; then
+                    removed="$removed $sec"
+                    rc=1
+                    continue
+                fi
+                cur=$(uci -q show firewall 2>/dev/null | iso6_render)
+                if [ "$(_iso6_line_of "$sec" "$cur")" != "$line" ]; then
+                    uci -q delete "firewall.$sec"
+                    logger -t ts-fix "isolate6: ERROR $sec did not read back as written (another writer committed mid-write) - removed; retrying on the next sync"
+                    removed="$removed $sec"
+                    rc=1
+                    continue
+                fi
+            fi
+            if [ "$how" = "create" ]; then added="$added $sec"; else updated="$updated $sec"; fi
+        done <<EOF
+$wrote
+EOF
+    fi
+
+    [ -n "$added" ] && msg="added$added"
+    [ -n "$updated" ] && msg="${msg:+$msg; }updated$updated"
+    [ -n "$removed" ] && msg="${msg:+$msg; }removed$removed"
+    _iso6_finish "$msg" || rc=1
+    return "$rc"
+}
+
+iso6_remove() {
+    local ours sec line removed="" rc=0
+    _iso6_show=$(uci -q show firewall 2>/dev/null)
+    ours=$(printf '%s\n' "$_iso6_show" | iso6_ours)
+    while read -r sec line; do
+        [ -n "$sec" ] || continue
+        if ! _iso6_name_ok "$sec"; then
+            logger -t ts-fix "isolate6: ERROR section name '$sec' outside [A-Za-z0-9_] - not deleted"
+            rc=1
+        elif uci -q delete "firewall.$sec"; then
+            removed="$removed $sec"
+        else
+            logger -t ts-fix "isolate6: ERROR could not delete $sec"
+            rc=1
+        fi
+    done <<EOF
+$ours
+EOF
+    _iso6_finish "${removed:+removed$removed}" || rc=1
+    return "$rc"
+}
+
+# The lock is non-blocking: syncs arrive in bursts (one per interface event, plus the watchdog's
+# backstop), each converges on the whole config, and one that finds another running has nothing to
+# add - the next event or the backstop picks up anything that changed after the running one read
+# the config.
+# `touch` gates the `exec`: a failed redirection on a special built-in ends the shell in dash and
+# BusyBox ash, and a full /tmp must not stop the sync; it then runs unserialized, and says so.
+# Only flock's rc 1 means held (BusyBox flock -n, checked on the lab routers); any other failure
+# (127: no flock at all) means no lock to be had, and the sync runs unserialized with a WARNING.
+iso6_main() {
+    local lrc
+    case "${1:-}" in
+        sync|remove) ;;
+        *)
+            echo "usage: ts-fix-isolate6 sync|remove" >&2
+            return 2
+            ;;
+    esac
+    if touch "$ISO6_LOCK" 2>/dev/null; then
+        exec 9>"$ISO6_LOCK"
+        flock -n 9 2>/dev/null
+        lrc=$?
+        [ "$lrc" = "1" ] && return 0
+        [ "$lrc" = "0" ] ||
+            logger -t ts-fix "isolate6: WARNING flock unavailable (rc $lrc) - running unserialized"
+    else
+        logger -t ts-fix "isolate6: WARNING cannot create $ISO6_LOCK - running unserialized"
+    fi
+    # Our own installed file gone means the package is being removed, and postrm owns cleanup then.
+    [ -e "${ISO6_SELF:-/usr/bin/ts-fix-isolate6}" ] || return 0
+    case "$1" in
+        sync)   iso6_sync ;;
+        remove) iso6_remove ;;
+    esac
+}
+
+# Sourcing the script (the unit test does) must not run a verb. `set -f` above is process-wide and
+# stays off for anything that sources this file.
+[ "${ISO6_NO_MAIN:-0}" = "1" ] || iso6_main "$@"

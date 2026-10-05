@@ -22,18 +22,127 @@ is_fw49_plus() {
 # Always preserve config so postinst can restore it after reinstall.
 # opkg --force-reinstall does NOT set PKG_UPGRADE=1, so the teardown
 # below would destroy user settings. Saving to /tmp lets postinst
-# restore the config regardless of whether this is a removal, upgrade,
-# or reinstall.
+# restore the config whenever the teardown below has deleted it. On an
+# upgrade postinst keeps the live file instead, which can be newer than
+# this copy (its config-restore block says why).
 cp /etc/config/ts-fix /tmp/ts-fix-config.saved 2>/dev/null
 
 # On upgrade, skip teardown — new version takes over
 [ "$PKG_UPGRADE" = "1" ] && exit 0
+
+# --- Removal-window writer neutralization ----------------------------------------------------
+# A removal must be atomic against the plugin's own engine writers, or state written DURING the
+# window survives with no plugin left to undo it. Proven in the sibling gl-zerotier-fix
+# ("finding 43", 2026-08-21): netifd fired a late wan6 DHCPv6 ifup mid-removal, the
+# still-installed iface hotplug spawned a reapply, and the converge re-armed from the
+# still-present config AFTER teardown — stranding enforcement with no engine. ts-fix has FIVE
+# writers to neutralize, in spawn-source order, BEFORE the teardown below runs (a sixth, the
+# ts-fix-isolate6 sync, is serialized by postrm instead; see item 1):
+#
+#   1. hotplug handlers — netifd runs them on its own schedule: 20-ts-fix spawns a reapply on any
+#      ifup (or ANY event while Tailscale is disabled), 10-ts-fix-ks runs the engine's
+#      lock-free rules-ensure on any non-loopback ifup, which re-installs the rule layer for as
+#      long as the intent UCI still reads armed — and that UCI is only deleted at the end of this
+#      script, after the disarm has removed the rules — and 98-ts-fix-isolate6 starts a delayed,
+#      detached ts-fix-isolate6 sync on uplink events, which writes and commits IPv6 isolate rules.
+#      All three are our own files and opkg deletes them right after this script anyway; deleting
+#      them FIRST means no iface event inside the removal window can ever birth a writer. Upgrades
+#      keep them via the PKG_UPGRADE guard above. An isolate6 sync already under way (from this
+#      handler, the watchdog's backstop or postinst) is not drained here: postrm holds its lock
+#      while it deletes the IPv6 rules, and a sync that gets the lock once opkg has deleted the
+#      script does nothing.
+rm -f /etc/hotplug.d/iface/20-ts-fix /etc/hotplug.d/iface/10-ts-fix-ks \
+      /etc/hotplug.d/iface/98-ts-fix-isolate6 2>/dev/null
+
+#   2. boot guard — KILLED BEFORE the service stop below, for two reasons. First, it is a
+#      DETACHED orphan subshell (procd does not track it; a stop cannot reach it) that
+#      watches `ip monitor rule` for up to 180s after any armed service start and re-asserts
+#      the 5279 rules within MILLISECONDS of a deletion event — left alive it deterministically
+#      reverts this script's own rule teardown (the intent UCI it gates on is only deleted at
+#      the end of this script): a stranded armed kill switch with no package behind it.
+#      Second, a guard spawned by a pre-fix init.d inherits rc.common's fd-1000 service lock
+#      (and, under a postinst-driven start, opkg's own lock on fd 3), so `init.d stop` issued
+#      while it lives QUEUES until the guard dies — measured live on MT3000 4.9.0: a removal
+#      inside the guard window stalled 178-180s, and a capped stop returned rc=124 while
+#      killing the guard dropped the same stop to 0.03s. Killing the monitor processes EOFs
+#      the guard's read loop, which then exits (and releases every inherited lock); the
+#      pattern also matches the busybox `timeout` wrapper, whose death alone would NOT stop
+#      the ip child. An operator's own ad-hoc `ip monitor rule` would match too — acceptable
+#      during removal of the package that owns these rules. All three pgrep patterns in this
+#      script are EXTENDED regex (busybox pgrep reads ERE — a BRE-escaped alternation matches
+#      only its own literal, measured in the sibling plugin), and each brackets one letter so
+#      no OTHER instrument's pgrep of the same name — a test harness sampling this very
+#      removal — can match these lines' cmdlines, nor these lines match the sampler's.
+#      Nothing in prerm itself can self-match: it runs as a file, and the pattern text never
+#      appears in this process's cmdline.
+kill $(pgrep -f 'ip monitor rul[e]' 2>/dev/null) 2>/dev/null
+rm -f /tmp/ts-fix-bootguard.lock /tmp/ts-fix-bootguard.ready 2>/dev/null
 
 # Stop and disable procd service (removes UCI reload trigger)
 if [ -x /etc/init.d/ts-fix ]; then
     /etc/init.d/ts-fix stop 2>/dev/null
     /etc/init.d/ts-fix disable 2>/dev/null
 fi
+# Disable the pre-firewall pass the same way. It is a one-shot boot script: nothing running to
+# stop, and no event source that could run it inside the removal window. What matters is its S18
+# link, which opkg does not own and would otherwise leave dangling once the script is deleted.
+# The explicit rm covers a script that is already missing, where disable cannot run.
+if [ -x /etc/init.d/ts-fix-preboot ]; then
+    /etc/init.d/ts-fix-preboot disable 2>/dev/null
+fi
+rm -f /etc/rc.d/S18ts-fix-preboot 2>/dev/null
+
+#   3. watchdog leftover — procd's stop above owns the watchdog; this covers a failed stop,
+#      because a surviving watchdog is a REBIRTH source (its 5s poll spawns reapply). A daemon
+#      loop never finishes on its own, so it is killed outright rather than drained.
+kill $(pgrep -f 'ts-fix-watchdo[g]' 2>/dev/null) 2>/dev/null
+
+#   4. in-flight reapply drain — procd's TERM stops the watchdog SHELL, but a reapply it (or
+#      hotplug, or the RPC) had already spawned survives as an orphan and completes. Worst
+#      case it parks ~93s holding the engine lock (sleep 3 + 60s gl_tailscale wait + 30s
+#      Running wait), then writes firewall/UCI/daemon state AFTER the teardown below has
+#      swept. Bounded 100s wait covers that natural ceiling; a straggler still alive after it
+#      is killed — its pre-park writes (KS install, masq6) happen before the waits and are
+#      removed by the teardown that follows this drain.
+_i=0
+while [ $_i -lt 100 ] && pgrep -f 'ts-fix-reappl[y]' >/dev/null 2>&1; do
+    sleep 1
+    _i=$((_i + 1))
+done
+kill $(pgrep -f 'ts-fix-reappl[y]' 2>/dev/null) 2>/dev/null
+
+#   5. in-flight engine drain — a ts-fix-ks arm/disarm/check may be RUNNING, or blocked on the
+#      engine's own lock behind one that is, when the kills above land. Killing a caller does not
+#      reach it: the RPC spawns the engine detached and it outlives its parent, so an orphan pass
+#      can re-sever forwardings, re-record the sidecar, or re-commit AFTER the disarm below has
+#      restored them — the same write-after-teardown class as the reapply drain, one layer down.
+#      Engine operations are bounded (no daemon waits; the slowest step is a firewall reload), so
+#      30s covers a waiter queued behind one reload. A straggler past that is killed, and the
+#      disarm below then sweeps from the recorded state.
+_i=0
+while [ $_i -lt 30 ] && pgrep -f 'ts-fix-k[s]' >/dev/null 2>&1; do
+    sleep 1
+    _i=$((_i + 1))
+done
+kill $(pgrep -f 'ts-fix-k[s]' 2>/dev/null) 2>/dev/null
+
+#      A killed engine can leave a STAGED uci delta behind: it severs with `uci set` and records
+#      the pair with `uci add_list`, so a kill between the two leaves an UNRECORDED severed
+#      forwarding staged in /tmp/.uci — which this script's own `uci commit firewall` further
+#      down would then flush to flash, after the teardown had already swept, with no record for
+#      anything to restore from. Reverting here drops any such delta while nothing of OURS is
+#      staged yet (prerm's first uci write is the section-delete loop below), and it equally
+#      keeps us from committing a foreign half-edit — a LuCI session mid-save — on its behalf.
+#      NEW INSTRUMENT: `uci revert` gets a two-state on-device lint (staged delta present /
+#      absent) in the device block before the gate run.
+uci -q revert firewall 2>/dev/null
+
+# The neutralization above is bounded, not absolute; two residuals are accepted. A UI Apply
+# landing mid-removal can still spawn a detached engine writer through the RPC, until postrm's
+# nginx restart takes the RPC away. And a procd stop that fails leaves the watchdog alive to
+# respawn and spawn a reapply, which is what the kill and the drains below it cover on a
+# best-effort basis. Both are narrow windows against an operator-initiated removal.
+# ---------------------------------------------------------------------------------------------
 
 # Disable exit node advertisement and Tailscale SSH
 # pgrep guard — avoids spawning Go process if daemon already stopped;
@@ -41,21 +150,62 @@ fi
 pgrep tailscaled >/dev/null 2>&1 && \
     /usr/sbin/tailscale set --advertise-exit-node=false --ssh=false 2>/dev/null
 
-# Remove kill switch routing rules (both families) — 5279 current + 5280 legacy
+# Kill switch teardown. The engine restores exactly the forwardings it severed, reading the
+# src:dest record from the ks_severed sidecar in /etc/config/ts-fix — so this MUST run before
+# the UCI section deletes below and before that config file is removed at the end of this
+# script. A forwarding the user had already disabled was never recorded and is never re-enabled.
+#
+# The exit status is CAPTURED, not discarded, because it gates the deletion of that config file
+# at the end of this script. disarm fails (rc 1) when the firewall config could not be
+# enumerated or a write/commit did not land — in which case forwardings are still severed in
+# flash and the sidecar is the only thing that says which ones. Deleting the record on that path
+# leaves a dark LAN with no plugin, no record and no tooling to recover with. rc 127 stands for a
+# missing engine binary, where nothing was restored either.
+_ks_disarm_rc=0
+if [ -x /usr/bin/ts-fix-ks ]; then
+    /usr/bin/ts-fix-ks disarm || _ks_disarm_rc=$?
+else
+    _ks_disarm_rc=127
+fi
+# Belt-and-suspenders for a missing or broken engine. These are not legacy artifacts: the
+# priority-5279 rules and the table-100 unreachable route are the kill switch's CURRENT rule
+# layer on an armed router (5280 is its pre-v1.0.21 layout), and the engine's disarm above
+# removes them FIRST, before it restores any forwarding. Deleting them twice is harmless. Every
+# rule delete stays qualified "lookup 100", so GL's own 5280 blackhole rule is never touched.
 for fam in -4 -6; do
     ip $fam rule del iif br-lan priority 5279 lookup 100 2>/dev/null
     ip $fam rule del iif br-guest priority 5279 lookup 100 2>/dev/null
+    ip $fam rule del iif br-iot priority 5279 lookup 100 2>/dev/null
     ip $fam rule del iif br-lan priority 5280 lookup 100 2>/dev/null
     ip $fam rule del iif br-guest priority 5280 lookup 100 2>/dev/null
+    ip $fam rule del iif br-iot priority 5280 lookup 100 2>/dev/null
     ip $fam route del unreachable default table 100 2>/dev/null
 done
 
-# Remove guest subnet policy route fixup
-_gs=$(ip -4 addr show br-guest 2>/dev/null | awk '/inet /{print $2}' | sed 's|\.[0-9]*/|.0/|')
-[ -n "$_gs" ] && ip rule del to "$_gs" table main 2>/dev/null
+# The engine's source-rule swap marker. After removal nothing reads it. With the engine present,
+# the disarm above has already reverted the swap and removed the marker; with the engine missing,
+# the swap itself is part of the already-accepted engine-missing residual.
+rm -f /tmp/ts-fix-ks.srcswap 2>/dev/null
 
-# Remove guest routing firewall forwardings and legacy kill switch rules
-for section in ts_fix_guest2ts ts_fix_ts2guest ts_ks_lan2wan ts_ks_guest2wan; do
+# Remove guest subnet policy route fixup. The guest network comes from reapply's own tested helper
+# (guest_net: ipcalc.sh, right for any prefix length — zeroing the last octet is right only for a
+# /24 and misses the rule on any other guest network). It is loaded from the installed reapply,
+# which opkg deletes only after this script, rather than copied here. The eval runs nothing but
+# the marked helper block of our own root-owned package file.
+eval "$(awk '/^# ---8<--- guest_net/,/^# ---8<--- end guest_net/' /usr/bin/ts-fix-reapply 2>/dev/null)"
+if command -v guest_net >/dev/null 2>&1; then
+    _gs=$(guest_net)
+    [ -n "$_gs" ] && ip rule del to "$_gs" table main 2>/dev/null
+else
+    logger -t ts-fix "prerm: guest_net helper not found in /usr/bin/ts-fix-reapply - guest route fixup (to <guest net> table main) not removed"
+fi
+
+# Remove guest routing firewall forwardings, the kill switch's lan -> tailscale0 tunnel path,
+# and legacy kill switch rules. ts_fix_lan2ts is normally dropped by the disarm above (only when
+# the engine recorded creating it); this catches the case where disarm never ran or did not
+# finish. The name is ours — GL's own lan -> tailscale0 forwarding is a different section and is
+# not reachable by this delete.
+for section in ts_fix_guest2ts ts_fix_ts2guest ts_fix_lan2ts ts_ks_lan2wan ts_ks_guest2wan; do
     uci -q delete firewall."$section" 2>/dev/null
 done
 
@@ -87,14 +237,31 @@ uci commit firewall 2>/dev/null
 # Clean up empty directories (opkg doesn't remove them)
 rm -rf /usr/share/ts-fix
 
-# Remove UCI config
-rm -f /etc/config/ts-fix
+# Engine runtime residue in tmpfs — the serialization lock, the commit-failure sentinel, the two
+# warning fingerprints, and reapply's daemon-settings-pending flag. Nothing is left to read them
+# once the package is gone; a stale sentinel or pending flag would otherwise be the first thing a
+# reinstall sees.
+rm -f /tmp/ts-fix-ks.lock /tmp/ts-fix-ks.commit-failed /tmp/ts-fix-ks.scopewarn \
+      /tmp/ts-fix-ks.defroutewarn /tmp/ts-fix-daemon-pending 2>/dev/null
 
-# Restart nginx to remove our injection
-# (reload does NOT reliably update all workers on GL routers)
-if [ -x /etc/init.d/nginx ]; then
-    kill -9 $(pgrep nginx) 2>/dev/null
-    /etc/init.d/nginx start 2>/dev/null
-fi
+# Same staged-delta hygiene for our own package, after the disarm above (which commits its own
+# work internally) and before the config file goes: a killed engine can leave a staged ts-fix
+# delta in /tmp/.uci, and staged state outlives the file — a later reinstall's first intent read
+# would see it shadowing the freshly restored config. NEW INSTRUMENT: same two-state on-device
+# lint as the firewall revert above.
+uci -q revert ts-fix 2>/dev/null
+
+# Remove UCI config — ONLY when the disarm above actually restored what it severed. On a failed
+# or skipped disarm the ks_severed record in this file is the sole map back to a working LAN, so
+# it is deliberately left behind for recovery. Keeping it holds on --force-reinstall too: postinst
+# keeps a live file over the copy saved at the top of this script, so the record survives it.
+[ "$_ks_disarm_rc" = "0" ] && rm -f /etc/config/ts-fix
+[ "$_ks_disarm_rc" = "0" ] || logger -t ts-fix -s "ERROR: ts-fix-ks disarm failed (rc $_ks_disarm_rc) - lan/guest/iot forwardings may still be severed in /etc/config/firewall; keeping /etc/config/ts-fix so the ks_severed record survives for recovery"
+
+# NOTE: the nginx restart that used to live here has moved to pkg/postrm.
+# Restarting from prerm cannot drop the injection: opkg deletes package files
+# AFTER prerm runs, so the conf and lua files are still on disk and the fresh
+# workers simply re-load them. postrm runs after the deletion, which is the
+# first point at which a restart actually removes it.
 
 exit 0

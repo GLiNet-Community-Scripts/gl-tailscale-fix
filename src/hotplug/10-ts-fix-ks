@@ -1,0 +1,29 @@
+#!/bin/sh
+# gl-tailscale-fix hotplug — kill-switch rule layer, priority 10 (BEFORE GL's 19-tailscale-iface)
+#
+# On every non-loopback ifup this re-installs the kill switch's routing-policy rule layer (the
+# priority-5279 rules, the table-100 unreachable route, and the guest/iot source-rule swap that
+# keeps GL's priority-0 "from <network>" rules from routing those networks around them) through
+# the engine's lock-free rules-ensure, which self-gates on armed intent and Router mode and makes
+# no `ip` call at all on a disarmed router. netifd's start wipes every policy rule, so after a boot
+# or a network restart the rule layer is gone until something re-adds it; this handler is the
+# first thing that does.
+#
+# ORDERING CONTRACT — the number is load-bearing, and it is below 19 on purpose. /sbin/hotplug-call
+# sources every handler in its own subshell, one at a time, in `ls` order, so this one has finished
+# (rules in place) before 19-tailscale-iface starts. GL's 19 starts a backgrounded chain,
+# `gl_tailscale restart`, that ends in a firewall restart (GL 4.9.0 and 4.11 do so whenever the
+# tailscale0 masq option exists). That restart flushes netfilter and opens the zone layer for as
+# long as it takes; the rule layer is routing policy, not netfilter, and it is what covers that
+# window. Renaming this file to a number of 19 or above silently reopens the window: the chain
+# would already be running before the rules exist, and the ordering would become a race.
+#
+# This file is itself sourced by hotplug-call, so the engine runs as a separate command and is
+# never sourced here: its process-wide `set -f` and its dispatch on "$1" must stay out of
+# hotplug-call's subshell. No UCI writes, no backgrounding, no reapply (that is 20-ts-fix's job).
+# Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
+# https://github.com/RemoteToHome-io/gl-tailscale-fix
+
+if [ "$ACTION" = "ifup" ] && [ "$INTERFACE" != "loopback" ] && [ -x /usr/bin/ts-fix-ks ]; then
+    /usr/bin/ts-fix-ks rules-ensure </dev/null >/dev/null 2>&1
+fi

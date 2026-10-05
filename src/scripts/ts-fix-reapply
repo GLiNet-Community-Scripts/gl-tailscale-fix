@@ -2,9 +2,25 @@
 # gl-tailscale-fix: Re-apply settings after GL's "tailscale up --reset"
 # Called by procd reload trigger (uci commit tailscale) and hotplug (ifup).
 # Waits for GL's gl_tailscale restart to finish, then re-applies exit node,
-# guest routes, firewall forwardings, and kill switch routing rules.
+# guest routes, firewall forwardings, and the two-layer kill switch (owned
+# entirely by /usr/bin/ts-fix-ks).
+#
+# Pending-flag contract: when tailscaled is not Running within the wait below the daemon-level half
+# is skipped and /tmp/ts-fix-daemon-pending is left behind as the watchdog's retry signal, and any
+# pass that does apply those settings — or that tears everything down — removes it again. A pass
+# whose Route Guest read of the advertised routes fails leaves it behind too (see there).
+#
+# Every call into the tailscale CLI below runs under `timeout 10`: the watchdog runs this script
+# synchronously, so one hung call would stall every kill-switch backstop behind it. A `tailscale
+# set` that fails is logged; a read that fails or times out prints nothing, and each read's caller
+# treats that as it treats the daemon being down. tests/unit/test-ks-armdisarm.sh (case TS) fails
+# on an unbounded call.
 # Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
 # https://github.com/RemoteToHome-io/gl-tailscale-fix
+
+# `timeout` ships in ROM on GL 4.8.4, 4.9.0 and 4.11. Where it is missing, run the command
+# unbounded as before rather than not at all: without it every bounded call would fail with 127.
+command -v timeout >/dev/null 2>&1 || timeout() { shift; "$@"; }
 
 # Firmware detection — on GL 4.9+, some features overlap with GL's native
 # Tailscale enhancements. We keep the plugin fully active (kill switch, guest
@@ -93,40 +109,171 @@ ensure_wan_v6_masq_for_exit_node() {
     fi
 }
 
-enabled=$(uci -q get tailscale.settings.enabled)
+# Strip Tailscale tailnet tokens out of a dnsmasq "domain" value.
+#
+# GL writes the tailnet MagicDNS suffix into dhcp.@dnsmasq[0].domain, which dnsmasq then
+# advertises to LAN clients. 4.8 APPENDS it ("<suffix> <original>"); 4.9 REPLACES the value
+# outright ("<suffix>"). This removes any tailnet token from either shape and echoes the
+# remainder, which may legitimately be empty (the 4.9 case — the caller falls back).
+#
+# Matches a bare "ts.net" as well as "*.ts.net": gl_tailscale falls back to dns_suffix="ts.net"
+# when the daemon returns no MagicDNS suffix, and a suffix-only match would silently leave the
+# fingerprint in place in exactly that degraded case.
+#
+# The case arms are anchored so a lookalike ("notts.net", "ts.net.example.com") is preserved.
+# Unit-tested by tests/unit/test-domain-clean.sh — keep the markers intact, it extracts them.
+# ---8<--- ts_domain_clean (unit-tested by tests/unit/test-domain-clean.sh) ---8<---
+ts_domain_clean() {
+    local out="" tok
+    for tok in $1; do
+        case "$tok" in
+            ts.net|*.ts.net) ;;
+            *) out="${out:+$out }$tok" ;;
+        esac
+    done
+    echo "$out"
+}
+# ---8<--- end ts_domain_clean ---8<---
 
-# If Tailscale is disabled, tear down all ts-fix state and exit.
+# Guest network helpers for Route Guest.
+#
+# guest_net echoes br-guest's IPv4 network as NETWORK/PREFIX, or nothing when br-guest has no IPv4
+# address or ipcalc fails. The network comes from ipcalc.sh, the tool GL's own script relies on to
+# build its "from <guest net>" rule, never from zeroing the last octet: that is right only for a
+# /24. 192.168.9.1/23 is network 192.168.8.0/23, and 192.168.9.0/23 would miss GL's rule in
+# the swap below and advertise a route that is not a network address. Only the first IPv4 address
+# is read, as the RPC reads it, and only one of the form a.b.c.d/N is handed to ipcalc: for an
+# empty or prefix-less argument ipcalc answers 0.0.0.0/0, which must never reach the code below.
+#
+# route_list_drop echoes the comma-separated route list $1 without the entry $2, comparing whole
+# entries as strings. Removal used to run sed with the subnet inside the program, where its "/"
+# ended the s command — sed failed, and its empty output took the --advertise-routes= branch — and
+# its dots would have matched any character.
+#
+# IPCALC exists so tests/unit/test-guest-net.sh can substitute a fake; nothing else sets it.
+# ---8<--- guest_net (unit-tested by tests/unit/test-guest-net.sh) ---8<---
+IPCALC=${IPCALC:-/bin/ipcalc.sh}
+
+guest_net() {
+    local addr out
+    addr=$(ip -4 addr show br-guest 2>/dev/null |
+        awk '$1 == "inet" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ { print $2; exit }')
+    [ -n "$addr" ] || return 0
+    out=$("$IPCALC" "$addr" 2>/dev/null) || return 0
+    printf '%s\n' "$out" | awk -F= '
+        $1 == "NETWORK" { n = $2 }
+        $1 == "PREFIX" { p = $2 }
+        END { if (n ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && p ~ /^[0-9]+$/) print n "/" p }'
+}
+
+route_list_drop() {
+    local out="" r
+    for r in $(printf '%s\n' "$1" | tr ',' ' '); do
+        [ "$r" = "$2" ] || out="${out:+$out,}$r"
+    done
+    printf '%s\n' "$out"
+}
+# ---8<--- end guest_net ---8<---
+
+# ---8<--- ts_state
+# The kill switch's intent, read as the engine reads it (_ks_intent in /usr/bin/ts-fix-ks). This
+# block is byte-identical in ts-fix-watchdog, ts-fix-reapply, hotplug 20-ts-fix and postinst;
+# tests/unit/test-ts-state.sh holds the copies to that, and to the engine's meaning.
+#
+# `uci -q get` prints nothing and returns 1 both for an absent option and for a read that failed,
+# so it cannot tell "off" from "unknown", and a failed read taken for "off" tears protection down.
+# `uci -q show <pkg>.settings` can: a readable section prints its own "<pkg>.settings=<type>" line
+# first, and a failed read prints nothing. An option absent from a readable section is off (GL's
+# slider accessory deletes tailscale.settings.enabled to restore its never-set state); a failed read
+# is UNKNOWN, and no caller may act on it as off. Shell matching only: no fork beyond the uci call.
+#
+# ts_state — tailscale.settings, read once: ts_en is 1 when it holds enabled='1', 0 for any other
+# value or none, and EMPTY when the read failed (rc 1); ts_eip is exit_node_ip's value, empty when
+# absent, and means something only when ts_en is not empty. uci prints the value single-quoted, and
+# an address holds no quote of its own, so the outer pair is all there is to strip.
+ts_state() {
+    local out nl='
+'
+    ts_en=""
+    ts_eip=""
+    out=$(uci -q show tailscale.settings 2>/dev/null)
+    case "$out" in
+        "tailscale.settings="*) ;;
+        *) return 1 ;;
+    esac
+    ts_en=0
+    case "$out$nl" in
+        *"${nl}tailscale.settings.enabled='1'$nl"*) ts_en=1 ;;
+    esac
+    case "$out" in
+        *"${nl}tailscale.settings.exit_node_ip="*)
+            ts_eip=${out#*"${nl}tailscale.settings.exit_node_ip="}
+            ts_eip=${ts_eip%%"$nl"*}
+            ts_eip=${ts_eip#\'}
+            ts_eip=${ts_eip%\'}
+            ;;
+    esac
+    return 0
+}
+
+# ks_state — ts-fix.settings, read once: ks_on is 1 when it holds kill_switch='1', 0 for any other
+# value or none, and EMPTY when the read failed (rc 1).
+ks_state() {
+    local out nl='
+'
+    ks_on=""
+    out=$(uci -q show ts-fix.settings 2>/dev/null)
+    case "$out" in
+        "ts-fix.settings="*) ;;
+        *) return 1 ;;
+    esac
+    ks_on=0
+    case "$out$nl" in
+        *"${nl}ts-fix.settings.kill_switch='1'$nl"*) ks_on=1 ;;
+    esac
+    return 0
+}
+# ---8<--- end ts_state
+
+# One read of tailscale.settings (ts_state, above). A read that failed is UNKNOWN, never "disabled":
+# taken for a disable it used to run the teardown below, which commits kill_switch=0 — a failed read
+# turned into a durable disarm. Nothing is done on it, and rc 1 says so; the watchdog's next poll
+# runs this again.
+ts_state
+if [ -z "$ts_en" ]; then
+    logger -t ts-fix "ERROR reapply: tailscale.settings could not be read - nothing done (no teardown, no re-apply); the watchdog retries"
+    exit 1
+fi
+
+# If Tailscale is disabled — enabled '0', or the option absent, as GL's slider leaves it — tear
+# down all ts-fix state and exit.
 # This covers the case where a user disables Tailscale while our switches
-# are active — routing rules, firewall forwardings, and policy routes must
+# are active — the kill switch, firewall forwardings, and policy routes must
 # be cleaned up, and UCI settings reset to 0 so everything starts clean
 # when Tailscale is re-enabled.
-if [ "$enabled" != "1" ]; then
-    # Remove kill switch routing rules (both families). Install moved to priority
-    # 5279; also drop any legacy 5280 rules from a pre-5279 install (only our exact
-    # lookup-100 rules — GL 4.9's 5280 blackhole is left untouched).
-    for fam in -4 -6; do
-        ip $fam rule del iif br-lan priority 5279 lookup 100 2>/dev/null
-        ip $fam rule del iif br-guest priority 5279 lookup 100 2>/dev/null
-        ip $fam rule del iif br-lan priority 5280 lookup 100 2>/dev/null
-        ip $fam rule del iif br-guest priority 5280 lookup 100 2>/dev/null
-        ip $fam route del unreachable default table 100 2>/dev/null
-    done
+if [ "$ts_en" = "0" ]; then
+    # Hand the kill switch back to its engine: it re-enables exactly the forwardings we severed and
+    # clears any RPDB-era rules an older install left behind. A failure here leaves LAN/guest/IoT
+    # egress severed, so say so loudly — the UCI reset below must not read as "all clean".
+    /usr/bin/ts-fix-ks disarm || logger -t ts-fix "teardown: ts-fix-ks disarm reported failure (rc $?) - severed state may need a manual ts-fix-ks disarm"
 
     # Remove guest policy route fixup
-    _gs=$(ip -4 addr show br-guest 2>/dev/null | awk '/inet /{print $2}' | sed 's|\.[0-9]*/|.0/|')
+    _gs=$(guest_net)
     [ -n "$_gs" ] && ip rule del to "$_gs" table main 2>/dev/null
 
     # Remove guest subnet from advertised routes (pgrep guard — avoids
     # spawning ~60MB Go process if daemon already stopped during disable)
     if [ -n "$_gs" ] && pgrep tailscaled >/dev/null 2>&1; then
-        _cur=$(/usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.AdvertiseRoutes[*]' 2>/dev/null | tr '\n' ',')
+        _cur=$(timeout 10 /usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.AdvertiseRoutes[*]' 2>/dev/null | tr '\n' ',')
         case ",$_cur," in
             *",$_gs,"*)
-                _new=$(echo "$_cur" | sed "s/${_gs},//;s/,${_gs}//;s/^${_gs}$//;s/,$//" )
+                _new=$(route_list_drop "$_cur" "$_gs")
                 if [ -n "$_new" ]; then
-                    /usr/sbin/tailscale set --advertise-routes="$_new" 2>/dev/null
+                    timeout 10 /usr/sbin/tailscale set --advertise-routes="$_new" 2>/dev/null || \
+                        logger -t ts-fix "teardown: tailscale set --advertise-routes failed or timed out (rc $?) - the guest subnet may still be advertised"
                 else
-                    /usr/sbin/tailscale set --advertise-routes= 2>/dev/null
+                    timeout 10 /usr/sbin/tailscale set --advertise-routes= 2>/dev/null || \
+                        logger -t ts-fix "teardown: tailscale set --advertise-routes= failed or timed out (rc $?) - the guest subnet may still be advertised"
                 fi
                 ;;
         esac
@@ -162,7 +309,20 @@ if [ "$enabled" != "1" ]; then
     ensure_wan_v6_masq_for_exit_node 0
 
     # Disable Tailscale SSH (pgrep guard — avoids spawning Go process if daemon already stopped)
-    pgrep tailscaled >/dev/null 2>&1 && /usr/sbin/tailscale set --ssh=false 2>/dev/null
+    if pgrep tailscaled >/dev/null 2>&1; then
+        timeout 10 /usr/sbin/tailscale set --ssh=false 2>/dev/null || \
+            logger -t ts-fix "teardown: tailscale set --ssh=false failed or timed out (rc $?) - Tailscale SSH may still be on"
+    fi
+
+    # Stop owning the dnsmasq advertised domain. We deliberately do NOT write the tailnet
+    # suffix back — GL restores the user's original itself on its own disable path, and it
+    # re-asserts the suffix on the next enable. Clearing user_domain means a later re-enable
+    # re-derives from whatever the user's value is then, rather than resurrecting a stale one.
+    #
+    # hide_ts_domain itself is NOT reset: it is a persistent preference describing what should
+    # be advertised whenever Tailscale is on, so it survives disable/enable cycles — same
+    # treatment as ks_follow_exit_node.
+    uci -q delete ts-fix.settings.user_domain
 
     # Reset all ts-fix UCI settings to 0
     uci -q set ts-fix.settings.kill_switch=0
@@ -170,6 +330,9 @@ if [ "$enabled" != "1" ]; then
     uci -q set ts-fix.settings.advertise_exit_node=0
     uci -q set ts-fix.settings.tailscale_ssh=0
     uci commit ts-fix
+
+    # Nothing can be pending once every setting is torn down and intent is back to 0.
+    rm -f /tmp/ts-fix-daemon-pending 2>/dev/null
 
     exit 0
 fi
@@ -179,49 +342,102 @@ LOCK="/tmp/ts-fix-reapply.lock"
 exec 200>"$LOCK"
 flock -n 200 || exit 0
 
-# Kill switch (policy routing: ip rule priority 5279 -> table 100 unreachable
-# default). Priority 5279 sits just after Tailscale's exit-node rule (5270),
-# ahead of GL 4.9's own ts_killswitch (an iif-br-lan blackhole at 5280). GL's is
-# IPv4-only and br-lan-only, so it backstops nothing for IPv6 or guest — ours at
-# 5279 is the only complete kill switch. Moving off 5280 also ends the priority
-# collision and makes ours unambiguously authoritative.
-# Design C: the KS lifecycle is driven ONLY by the user's kill_switch
-# intent plus Tailscale being enabled (the enabled!=1 teardown above already
-# handles a user disable). It deliberately does NOT depend on exit-node state,
-# so it stays armed through every "tailscale up --reset" transient and is
-# unaffected by the daemon's transient or stale ExitNodeID — fail-secure: block,
-# never leak the real IP. Applied HERE, before the daemon waits below, so the
-# rules come up immediately at boot even if tailscaled is slow to start or never
-# reaches Running. Only a kill_switch=0 toggle or a Tailscale disable removes it.
-kill_switch=$(uci -q get ts-fix.settings.kill_switch)
-if [ "$kill_switch" = "1" ]; then
-    # "ip -6" errors are suppressed — harmless if IPv6 is compiled out (calls
-    # fail) or merely disabled (rules install inert).
-    # Exact-rule grep ("iif br-lan " AND "lookup 100"): a bare "iif br-lan" match
-    # would also match a stray "iif br-lan blackhole" (GL's 5280) and wrongly skip
-    # our install — the v1.0.21 loose-grep bug. Moot at 5279, kept exact as
-    # defense-in-depth.
-    for fam in -4 -6; do
-        ip $fam route show table 100 2>/dev/null | grep -q "unreachable default" || \
-            ip $fam route add unreachable default table 100 2>/dev/null
-        ip $fam rule list priority 5279 2>/dev/null | grep "iif br-lan " | grep -q "lookup 100" || \
-            ip $fam rule add iif br-lan priority 5279 lookup 100 2>/dev/null
-        ip $fam rule list priority 5279 2>/dev/null | grep "iif br-guest " | grep -q "lookup 100" || \
-            ip $fam rule add iif br-guest priority 5279 lookup 100 2>/dev/null
-        # Migration: with 5279 now up (no gap), drop any legacy priority-5280 rule
-        # from a pre-5279 install. Only our exact lookup-100 rules — GL's 5280
-        # blackhole stays.
-        ip $fam rule del iif br-lan priority 5280 lookup 100 2>/dev/null
-        ip $fam rule del iif br-guest priority 5280 lookup 100 2>/dev/null
-    done
+# Kill switch (two layers). ALL kill-switch logic lives in /usr/bin/ts-fix-ks — this block only
+# expresses intent and calls it, and no other component may touch zone, rule or severed state
+# directly. The zone layer: the engine severs every lan/guest/iot -> uplink-class firewall
+# forwarding, recording each as a src:dest pair in the ts-fix.settings.ks_severed sidecar so a
+# disarm restores exactly what we disabled, and ensures lan -> tailscale0 so an armed router routes
+# through the tunnel instead of going dark. It lives in flash-persisted UCI that the firewall
+# re-emits at every lifecycle event and applies at boot before any uplink comes up, with no
+# dependency on tailscaled being alive; a firewall restart opens it for a moment. The rule layer:
+# the priority-5279 rules in front of an unreachable route in table 100, plus the guest/iot
+# source-rule swap. A firewall restart does not touch it; netifd's start (boot, network restart)
+# wipes it, and the 10-ts-fix-ks hotplug handler re-installs it at the next non-loopback ifup,
+# while the zone layer holds. Each layer survives the other's eraser, so neither a boot-time early
+# install nor a flush-reactive guard is needed (the engine's header has the detail).
+#
+# Design C is unchanged: armed iff the user's kill_switch intent is on AND Tailscale is enabled
+# (the teardown above handles a user disable). Nothing reads exit-node state, so the daemon's
+# transient or stale ExitNodeID can neither arm nor disarm it — fail-secure: block, never leak the
+# real IP. Only a kill_switch=0 toggle or a Tailscale disable takes it down.
+#
+# kill_switch is read the three-state way (ks_state, above). A read that failed is neither arm nor
+# disarm: one ERROR, and the kill switch is left exactly as it is — the engine's own check, on the
+# watchdog's next poll, reads intent itself and is the authority. Taking it for "off" used to
+# disarm an armed router.
+#
+# Established flows are carried by masq/masq6 rather than by anything here: on interface death
+# masquerade's device-down handler purges its conntrack entries, and on exit-node clear tailscaled's
+# own config-change cleanup purges them (device-measured on fw3 2026-08-17; fw4 re-proof is a ship
+# gate). Applied HERE, before the daemon waits below, because arming needs no daemon state at all.
+ks_state
+if [ -z "$ks_on" ]; then
+    logger -t ts-fix "ERROR reapply: ts-fix.settings could not be read - kill switch left as it is (neither armed nor disarmed); the engine's check is the authority"
+elif [ "$ks_on" = "1" ]; then
+    # Neither a mode refusal (rc 2) nor an engine failure (rc 1) may abort this script: the
+    # domain, masquerade, exit-node and guest work below is independent of the kill switch and
+    # still has to run. The engine has already logged its own reason in both cases; these lines
+    # add the caller's context. On rc 1 the kill switch may NOT be effective — the watchdog's
+    # check pass is the retry.
+    /usr/bin/ts-fix-ks arm
+    _ks_rc=$?
+    if [ "$_ks_rc" = "2" ]; then
+        logger -t ts-fix "kill switch not armed: requires Router mode (glconfig.general.mode) - continuing with remaining reapply work"
+    elif [ "$_ks_rc" != "0" ]; then
+        logger -t ts-fix "ERROR: ts-fix-ks arm failed (rc $_ks_rc) - kill switch may NOT be effective; engine will retry on watchdog check"
+    fi
 else
-    for fam in -4 -6; do
-        ip $fam rule del iif br-lan priority 5279 lookup 100 2>/dev/null
-        ip $fam rule del iif br-guest priority 5279 lookup 100 2>/dev/null
-        ip $fam rule del iif br-lan priority 5280 lookup 100 2>/dev/null
-        ip $fam rule del iif br-guest priority 5280 lookup 100 2>/dev/null
-        ip $fam route del unreachable default table 100 2>/dev/null
-    done
+    /usr/bin/ts-fix-ks disarm || logger -t ts-fix "ts-fix-ks disarm reported failure (rc $?)"
+fi
+
+# Hide the Tailscale search domain from LAN clients (opt-in, v1.0.22).
+#
+# GL writes the tailnet MagicDNS suffix into dhcp.@dnsmasq[0].domain, which dnsmasq advertises
+# to DHCP clients — so every LAN device, including a corporate-managed laptop, receives
+# "<tailnet>.ts.net" as its domain/search suffix. That is a passive signal that the machine sits
+# behind a Tailscale node. It also breaks local .lan resolution on 4.9, where GL REPLACES the
+# value rather than appending to it (expandhosts then qualifies hostnames into the tailnet
+# domain instead of the user's).
+#
+# We take ownership of that one value. /etc/dnsmasq.conf's "server=/…/100.100.100.100" entry is
+# deliberately untouched, so an explicit tailnet FQDN still resolves — only the broadcast hint
+# goes away. gl_tailscale is the sole writer of this field on both firmwares (verified), so this
+# is the only place we have to contest.
+#
+# REACTIVE, never authoritative: we only ever strip a tailnet token, never impose a remembered
+# value over one the user has since chosen. Enforcing a value cached at first-enable would fight
+# a user who later edited their local domain in LuCI — we would keep writing the old one back
+# over their edit. user_domain is therefore a fallback for the 4.9 replace case only, and it is
+# refreshed from whatever clean value the user currently has.
+#
+# Applied here, before the daemon waits below, because it needs no daemon state at all.
+hide_ts_domain=$(uci -q get ts-fix.settings.hide_ts_domain)
+if [ "$hide_ts_domain" = "1" ]; then
+    cur_domain=$(uci -q get "dhcp.@dnsmasq[0].domain")
+    want=$(ts_domain_clean "$cur_domain")
+    if [ "$want" = "$cur_domain" ]; then
+        # No tailnet token present — nothing to do. Adopt the current value as the user's
+        # domain so that when GL next writes the suffix, we restore what they actually chose.
+        if [ -n "$cur_domain" ] && \
+           [ "$(uci -q get ts-fix.settings.user_domain)" != "$cur_domain" ]; then
+            uci set ts-fix.settings.user_domain="$cur_domain"
+            uci commit ts-fix
+        fi
+    else
+        # A tailnet token was present. If stripping leaves nothing, this is the 4.9 replace
+        # case — fall back to our recorded value, then GL's own saved sidecar, then "lan".
+        if [ -z "$want" ]; then
+            want=$(uci -q get ts-fix.settings.user_domain)
+            [ -z "$want" ] && want=$(uci -q get tailscale.settings.original_domain)
+            [ -z "$want" ] && want="lan"
+        fi
+        logger -t ts-fix "hiding tailnet search domain: dnsmasq domain '$cur_domain' -> '$want'"
+        uci set "dhcp.@dnsmasq[0].domain=$want"
+        uci commit dhcp
+        uci set ts-fix.settings.user_domain="$want"
+        uci commit ts-fix
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1
+    fi
 fi
 
 # Ensure tailscale0 zone masquerade BEFORE waiting for tailscaled — a pure
@@ -268,25 +484,45 @@ while [ $i -lt 60 ]; do
     i=$((i + 1))
 done
 
-# Now wait for Running state (up to 30s)
+# GL's chain re-adds its guest/iot "from <net> lookup main" rule at its very end, after its firewall
+# restart, and that rule routes guest/iot traffic past the kill switch's priority-5279 rules until
+# the engine swaps it out again. The watchdog's next pass cannot be counted on for that: it may be
+# parked in this very script. So re-assert the rule layer now, within about a second of the chain
+# ending. rules-ensure takes no lock and self-gates on armed intent and Router mode, so on a
+# disarmed router it is a no-op.
+/usr/bin/ts-fix-ks rules-ensure </dev/null
+
+# Now wait for Running state (up to 30 tries a second apart; a status call that hangs is cut off
+# after 10s and reads as not Running, as a dead daemon does)
 # pgrep guard avoids spawning ~60MB Go CLI while daemon is still starting
 i=0
 state=""
 while [ $i -lt 30 ]; do
     if pgrep tailscaled >/dev/null 2>&1; then
-        state=$(/usr/sbin/tailscale status --json 2>/dev/null | jsonfilter -e '@.BackendState' 2>/dev/null)
+        state=$(timeout 10 /usr/sbin/tailscale status --json 2>/dev/null | jsonfilter -e '@.BackendState' 2>/dev/null)
         [ "$state" = "Running" ] && break
     fi
     sleep 1
     i=$((i + 1))
 done
-[ "$state" = "Running" ] || exit 0
+# A cold boot can push Running past this wait — a modem still booting behind the router, or a
+# clock with no RTC delaying NTP and therefore the control-plane TLS handshake. Every other boot
+# ifup event is swallowed by the flock above while this run holds it, so this is the ONLY pass
+# that would have applied the daemon-level settings. Record that they are still pending instead of
+# exiting silently: the watchdog retries from the flag once the daemon reaches Running, which is
+# what keeps an exit-node advertisement from staying lost until the user's next manual Apply.
+if [ "$state" != "Running" ]; then
+    logger -t ts-fix "tailscaled not Running within wait - daemon-level settings (exit-node advert, SSH, routes) pending; watchdog will retry when Running"
+    touch /tmp/ts-fix-daemon-pending 2>/dev/null
+    exit 0
+fi
 
 # Re-apply exit node advertisement (skip false — already cleared by --reset).
 # On GL 4.9+, skip entirely — GL manages this natively via run_exit_node UCI.
 adv=$(uci -q get ts-fix.settings.advertise_exit_node)
 if [ "$adv" = "1" ] && ! is_fw49_plus; then
-    /usr/sbin/tailscale set --advertise-exit-node 2>/dev/null
+    timeout 10 /usr/sbin/tailscale set --advertise-exit-node 2>/dev/null || \
+        logger -t ts-fix "tailscale set --advertise-exit-node failed or timed out (rc $?) - exit-node advertisement not re-applied"
 fi
 
 # Ensure wan-zone IPv6 masquerade when this router is acting as a Tailscale
@@ -303,94 +539,154 @@ else
     ensure_wan_v6_masq_for_exit_node 0
 fi
 
-# Item 2: GL 4.9 Custom Exit Node reconciliation (defensive).
-# PLAN observed 2026-04-24 that GL 4.9's Apply sometimes set
-# `tailscale.settings.exit_node_ip` UCI without actually running
-# `tailscale set --exit-node=<ip>` — daemon ended up with empty
-# ExitNodeID, no table-52 default, user saw real IP. Pre-check
-# 2026-05-23 couldn't reproduce via `gl_tailscale restart` on MT3000
-# 4.9.0 (firmware unchanged per user — likely Tailscale binary update
-# or environmental factor changed since). Defensive reconcile catches
-# it if it reappears.
+# Exit-node reconcile: GL's UCI (tailscale.settings.exit_node_ip) is the
+# authoritative exit-node intent; push it to the daemon when the two disagree.
+# Originally shipped 4.9-gated in v1.0.20 (the bug was mis-attributed to GL's
+# 4.9 UI); v1.0.22 drops the firmware gate and adds the CLEAR direction — the
+# real cause is binary-side: tiny Tailscale builds with ts_omit_ipnbus (before
+# the upstream fix 2026-06-04) let GL's "tailscale up --reset" exit before the
+# exit-node dispatch lands, on ANY firmware (reproduced live on 4.8.5, E5800
+# control matrix 2026-06-03). Version Manager users run exactly those builds.
 #
-# Safety: value-snapshot signal. Track `last_seen_exit_node_ip` in
-# our own UCI. Reconcile only when the user's UCI exit_node_ip is a
-# NEW value (changed since our last reapply) AND daemon is empty AND
-# the value is non-empty. Avoids the re-enable failure mode where
-# unrelated GL Tailscale UCI commits bump /etc/config/tailscale mtime
-# while exit_node_ip is stale from a past use. (Red-team 2026-05-23
-# flagged the earlier mtime-only gate as insufficient — mtime doesn't
-# isolate "exit_node_ip changed" from "any UCI key in this file changed".)
-if is_fw49_plus; then
-    gl_exit_ip=$(uci -q get tailscale.settings.exit_node_ip)
-    ts_exit_id=$(/usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.ExitNodeID' 2>/dev/null)
-    last_seen=$(uci -q get ts-fix.settings.last_seen_exit_node_ip)
-    if [ "$gl_exit_ip" != "$last_seen" ]; then
-        # exit_node_ip value changed since our last reapply.
-        if [ -n "$gl_exit_ip" ] && [ -z "$ts_exit_id" ]; then
-            # New non-empty UCI but daemon hasn't caught up → reconcile.
-            logger -t ts-fix "4.9 reconcile: UCI exit_node_ip changed to $gl_exit_ip but daemon ExitNodeID empty — running tailscale set --exit-node"
-            /usr/sbin/tailscale set --exit-node="$gl_exit_ip" 2>/dev/null
-        fi
-        # Record current UCI value as our "last seen" regardless of
-        # whether we reconciled. Next reapply with the SAME value is
-        # treated as "no change, don't touch the daemon."
+# Safety: value-snapshot gate. Track `last_seen_exit_node_ip` in our own UCI
+# and reconcile only when the user's UCI exit_node_ip CHANGED since our last
+# reapply. This (a) avoids touching the daemon on unrelated UCI commits, and
+# (b) makes upgrades inert on pre-4.9 routers where an old GL disable left a
+# stale exit_node_ip behind — postinst seeds the snapshot to the current value
+# so only post-install transitions act (without the seed, the first reapply
+# would resurrect a long-dead exit node). The CLEAR direction gets a
+# no-snapshot retry path in the watchdog (table-52 check) because the
+# upstream failure is intermittent — one push may not land. Both directions
+# are capped with timeout: "tailscale set" was observed hanging once on a
+# buggy tiny binary, and reapply holds a flock other callers wait on.
+# A prefs read that fails or times out leaves ts_exit_id empty. SET then pushes
+# the configured exit node, the state it wants either way (a no-op where the
+# daemon already has it), and a CLEAR is skipped; the watchdog's table-52 check
+# clears a daemon exit node that outlives GL's UCI whatever this read returned.
+#
+# exit_node_ip is read again here, not taken from the top of the script: GL's chain and the waits
+# above can last a minute and more, and the value may have changed. The read is the three-state
+# one (ts_state, above): one that failed would leave exit_node_ip empty, which reads as the user
+# clearing the exit node — a CLEAR pushed to the daemon, the snapshot moved — so on a failed read
+# the reconcile is skipped, with one line, and the snapshot option is left as it is.
+ts_state
+gl_exit_ip=$ts_eip
+ts_exit_id=$(timeout 10 /usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.ExitNodeID' 2>/dev/null)
+last_seen=$(uci -q get ts-fix.settings.last_seen_exit_node_ip)
+if [ -z "$ts_en" ]; then
+    logger -t ts-fix "reconcile: tailscale.settings could not be read - exit-node reconcile skipped, snapshot left at '${last_seen}'"
+elif [ "$gl_exit_ip" != "$last_seen" ]; then
+    # exit_node_ip value changed since our last reapply. The binary version in
+    # the log lines attributes future field reports (tiny builds are the known
+    # buggy population); captured only when a reconcile actually fires.
+    reconcile_ok=1
+    if [ -n "$gl_exit_ip" ] && [ -z "$ts_exit_id" ]; then
+        # SET: new non-empty UCI but daemon hasn't caught up → push it.
+        bin_ver=$(timeout 10 /usr/sbin/tailscale version 2>/dev/null | head -1)
+        logger -t ts-fix "reconcile: UCI exit_node_ip changed to $gl_exit_ip but daemon ExitNodeID empty — running tailscale set --exit-node (binary: ${bin_ver:-unknown})"
+        timeout 10 /usr/sbin/tailscale set --exit-node="$gl_exit_ip" 2>/dev/null || reconcile_ok=0
+    elif [ -z "$gl_exit_ip" ] && [ -n "$ts_exit_id" ]; then
+        # CLEAR: UCI cleared but daemon ExitNodeID stuck → push empty.
+        # "tailscale set --exit-node=" clears via the EditPrefs LocalAPI
+        # path, which works even on the buggy ipnbus-omitting builds where
+        # "up --reset" silently fails (the 2026-06-03 verified workaround).
+        bin_ver=$(timeout 10 /usr/sbin/tailscale version 2>/dev/null | head -1)
+        logger -t ts-fix "reconcile: UCI exit_node_ip cleared but daemon ExitNodeID stuck — running tailscale set --exit-node= (binary: ${bin_ver:-unknown})"
+        timeout 10 /usr/sbin/tailscale set --exit-node= 2>/dev/null || reconcile_ok=0
+    fi
+    # Advance the snapshot only when the daemon actually matches the UCI intent —
+    # either no reconcile was needed, or the one we ran succeeded. Advancing after a
+    # FAILED push (timeout, transient daemon error) makes the next reapply see "no
+    # change" and never retry, stranding the daemon out of sync with the user's
+    # selection until they edit the value again. The SET direction has no other
+    # backstop: the watchdog's stuck-state check only covers CLEAR (UCI empty +
+    # table-52 default still present), so a dropped SET persists silently — and with
+    # the kill switch off, that means traffic keeps egressing the real WAN while the
+    # UI shows an exit node selected.
+    if [ "$reconcile_ok" = "1" ]; then
         uci set ts-fix.settings.last_seen_exit_node_ip="$gl_exit_ip"
         uci commit ts-fix
+    else
+        logger -t ts-fix "reconcile: tailscale set failed — leaving snapshot at '${last_seen}' so the next reapply retries"
     fi
 fi
 
 # Re-apply Tailscale SSH (skip false — already cleared by --reset)
 ts_ssh=$(uci -q get ts-fix.settings.tailscale_ssh)
-[ "$ts_ssh" = "1" ] && /usr/sbin/tailscale set --ssh 2>/dev/null
+if [ "$ts_ssh" = "1" ]; then
+    timeout 10 /usr/sbin/tailscale set --ssh 2>/dev/null || \
+        logger -t ts-fix "tailscale set --ssh failed or timed out (rc $?) - Tailscale SSH not re-applied"
+fi
 
 # Re-apply guest subnet route advertisement
 route_guest=$(uci -q get ts-fix.settings.route_guest)
-guest_subnet=$(ip -4 addr show br-guest 2>/dev/null | awk '/inet /{print $2}' | sed 's|\.[0-9]*/|.0/|')
+guest_subnet=$(guest_net)
+# ---8<--- route guest advertise (unit-tested by tests/unit/test-guest-net.sh) ---8<---
+routes_unread=0
 if [ "$route_guest" = "1" ]; then
     if [ -n "$guest_subnet" ]; then
-        # Get current routes, add guest subnet if missing
-        current=$(/usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.AdvertiseRoutes[*]' 2>/dev/null | tr '\n' ',')
-        case ",$current," in
-            *",$guest_subnet,"*) ;; # already present
-            *)
-                new_routes="${current}${guest_subnet}"
-                new_routes=$(echo "$new_routes" | sed 's/,$//')
-                /usr/sbin/tailscale set --advertise-routes="$new_routes" 2>/dev/null
-                ;;
-        esac
+        # Get current routes, add guest subnet if missing. --advertise-routes REPLACES the whole
+        # list, so the routes are read on their own first: a read that fails or times out prints
+        # nothing, and nothing must not pass for "no routes" — the add would then drop every other
+        # advertised route. Such a pass writes nothing and leaves the daemon-pending flag, as a pass
+        # with the daemon down does, so the watchdog retries it.
+        if prefs=$(timeout 10 /usr/sbin/tailscale debug prefs 2>/dev/null) && [ -n "$prefs" ]; then
+            current=$(printf '%s\n' "$prefs" | jsonfilter -e '@.AdvertiseRoutes[*]' 2>/dev/null | tr '\n' ',')
+            case ",$current," in
+                *",$guest_subnet,"*) ;; # already present
+                *)
+                    new_routes="${current}${guest_subnet}"
+                    new_routes=$(echo "$new_routes" | sed 's/,$//')
+                    timeout 10 /usr/sbin/tailscale set --advertise-routes="$new_routes" 2>/dev/null || \
+                        logger -t ts-fix "route guest: tailscale set --advertise-routes failed or timed out (rc $?) - the guest subnet is not advertised"
+                    ;;
+            esac
+        else
+            logger -t ts-fix "route guest: tailscale debug prefs failed or timed out - advertised routes unknown, guest subnet not added; pending for the watchdog's retry"
+            routes_unread=1
+        fi
     fi
 else
-    # Remove guest subnet from advertised routes if present
+    # Remove guest subnet from advertised routes if present. A failed read prints nothing, which
+    # matches no route, so nothing is written — as with the daemon down.
     if [ -n "$guest_subnet" ]; then
-        current=$(/usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.AdvertiseRoutes[*]' 2>/dev/null | tr '\n' ',')
+        current=$(timeout 10 /usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.AdvertiseRoutes[*]' 2>/dev/null | tr '\n' ',')
         case ",$current," in
             *",$guest_subnet,"*)
-                new_routes=$(echo "$current" | sed "s/${guest_subnet},//;s/,${guest_subnet}//;s/^${guest_subnet}$//;s/,$//" )
+                new_routes=$(route_list_drop "$current" "$guest_subnet")
                 if [ -n "$new_routes" ]; then
-                    /usr/sbin/tailscale set --advertise-routes="$new_routes" 2>/dev/null
+                    timeout 10 /usr/sbin/tailscale set --advertise-routes="$new_routes" 2>/dev/null || \
+                        logger -t ts-fix "route guest off: tailscale set --advertise-routes failed or timed out (rc $?) - the guest subnet may still be advertised"
                 else
-                    /usr/sbin/tailscale set --advertise-routes= 2>/dev/null
+                    timeout 10 /usr/sbin/tailscale set --advertise-routes= 2>/dev/null || \
+                        logger -t ts-fix "route guest off: tailscale set --advertise-routes= failed or timed out (rc $?) - the guest subnet may still be advertised"
                 fi
                 ;;
         esac
     fi
 fi
+# ---8<--- end route guest advertise ---8<---
 
-# Fix guest subnet policy route for exit node + kill switch compatibility.
-# Tailscale creates "from <guest_subnet> lookup main" at priority 0 when
-# the guest subnet is advertised. This blocks guest clients from using the
-# exit node AND bypasses the kill switch. Replace with "to <guest_subnet>"
-# (destination-based, matching Tailscale's LAN treatment).
+# Fix guest subnet policy route for exit node compatibility.
+# GL's gl_tailscale adds "from <guest_subnet> lookup main" at priority 0
+# whenever a Custom Exit Node is set and the guest network is enabled. This
+# blocks guest clients from using the exit node. Replace with "to
+# <guest_subnet>" (destination-based, the shape of GL's own LAN rule).
 if [ "$route_guest" = "1" ] && [ -n "$guest_subnet" ]; then
     ip rule del from "$guest_subnet" lookup main 2>/dev/null
     ip rule del to "$guest_subnet" table main 2>/dev/null
     ip rule add to "$guest_subnet" table main priority 0
 else
     # Clean up our destination-based rule if present
-    _gs=$(ip -4 addr show br-guest 2>/dev/null | awk '/inet /{print $2}' | sed 's|\.[0-9]*/|.0/|')
+    _gs=$(guest_net)
     [ -n "$_gs" ] && {
         ip rule del to "$_gs" table main 2>/dev/null
+        # That is also the kill switch's own rule: while armed, the engine's source-rule swap keeps
+        # exactly this "to <guest net>" rule in place of GL's "from" rule. Put it back at once
+        # rather than leave guest-bound traffic to the exit node's table until the next engine
+        # pass. rules-ensure takes no lock and self-gates on armed intent and Router mode, so on a
+        # disarmed router it is a no-op.
+        /usr/bin/ts-fix-ks rules-ensure </dev/null
     }
 fi
 
@@ -419,10 +715,18 @@ fi
 # Single firewall commit + reload for all accumulated guest forwarding changes
 [ "$_fw_dirty" = "1" ] && { uci commit firewall; /etc/init.d/firewall reload; }
 
-# Kill switch routing rules are installed near the top of this script now
-# (right after the flock), so they come up before the daemon waits and are
-# driven purely by the user's kill_switch intent. Nothing exit-node-dependent
-# remains here — see the "Kill switch (policy routing ...)" block above.
+# A pass reaching here applied every daemon-level setting against a Running daemon — nothing pends —
+# unless Route Guest's read of the advertised routes failed above, which leaves the flag behind.
+if [ "$routes_unread" = "1" ]; then
+    touch /tmp/ts-fix-daemon-pending 2>/dev/null
+else
+    rm -f /tmp/ts-fix-daemon-pending 2>/dev/null
+fi
+
+# The kill switch is applied near the top of this script (right after the
+# flock), before the daemon waits, driven purely by the user's kill_switch
+# intent. Nothing exit-node-dependent remains here — see the "Kill switch
+# (two layers)" block above.
 
 # Explicit success — earlier idempotent ip/uci deletes can return nonzero when
 # the target is already absent (normal no-op paths); don't propagate as failure.

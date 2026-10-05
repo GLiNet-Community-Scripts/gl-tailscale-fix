@@ -1,0 +1,13 @@
+#!/bin/sh
+# gl-tailscale-fix hotplug — priority 98 (after GL's 97-update_wan_isolate)
+# Keeps the IPv6 half of GL's "Block WAN Subnets" (/usr/bin/ts-fix-isolate6) in step with the
+# uplinks. GL rebuilds its IPv4 isolate rules from 97-update_wan_isolate on the same events (on
+# 4.8.4 in the background), so this waits a few seconds and then converges on GL's result, detached
+# so the event is never held up; the watchdog repeats the sync about every 30 s for anything no
+# event announces. Independent of Tailscale and of the kill switch.
+# Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
+# https://github.com/RemoteToHome-io/gl-tailscale-fix
+
+case "$ACTION" in ifup|ifupdate|ifdown) ;; *) exit 0 ;; esac
+[ -x /usr/bin/ts-fix-isolate6 ] || exit 0
+( sleep 3; /usr/bin/ts-fix-isolate6 sync ) </dev/null >/dev/null 2>&1 &
