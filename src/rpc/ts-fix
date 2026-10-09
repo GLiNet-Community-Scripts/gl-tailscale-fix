@@ -356,11 +356,12 @@ local function ensure_wan_v6_masq_for_exit_node(advertise_on)
 end
 
 -- Helper: fix guest subnet policy route for exit node compatibility.
--- When the guest subnet is advertised, Tailscale creates a source-based rule
--- at priority 0: "from <guest_subnet> lookup main". This catches ALL traffic
+-- When a Custom Exit Node is set and the guest network is enabled, GL's
+-- /usr/bin/gl_tailscale adds an IPv4 source-based rule with no priority, which
+-- lands at priority 0: "from <guest_subnet> table main". This catches ALL traffic
 -- originating from guest clients and sends it to the main table → WAN,
 -- completely bypassing the exit node (priority 5270). Replace with a
--- destination-based rule: "to <guest_subnet> table main" (matching Tailscale's
+-- destination-based rule: "to <guest_subnet> table main" (matching GL's
 -- own treatment of the LAN subnet). This preserves inbound tailnet→guest
 -- reachability while letting guest clients use the exit node. Confirmed by GL
 -- engineer prototype (gl_tailscale-guest). The kill switch has a routing layer
@@ -481,15 +482,17 @@ function M.get_config()
     -- nginx restart).
     res.ts_version = get_ts_version()
 
-    -- Kill switch state. The kill switch is firewall-zone state owned entirely by
-    -- /usr/bin/ts-fix-ks, so this only VERIFIES the engine's own record: every src:dest
+    -- Kill switch state. Both kill-switch layers are owned entirely by /usr/bin/ts-fix-ks, and
+    -- this reads only the zone layer (the priority-5279 rule layer is not checked here), so it
+    -- only VERIFIES the engine's own record: every src:dest
     -- pair listed in the ks_severed sidecar must still have a disabled forwarding behind
     -- it and no enabled one. Pure uci reads — no classification (that lives in the engine
     -- and nowhere else) and no shell-outs, because this runs on the UI's 10s poll.
     -- Fail-secure in every ambiguous direction: an empty record, a recorded pair whose
     -- sections have gone away, and a pair carrying an enabled section beside our disabled
-    -- one all report false. A torn state surfaces in the UI rather than claiming protection
-    -- it does not have; the engine's check pass — every watchdog poll — is what repairs it.
+    -- one all report false. A torn state reports false rather than claiming protection it does
+    -- not have (no UI element displays this field today); the engine's check pass — every
+    -- watchdog poll — is what repairs it.
     local severed = c:get(TS_FIX_CONFIG, "settings", "ks_severed")
     local sev_pairs = {}
     if type(severed) == "table" then
@@ -536,9 +539,9 @@ function M.get_config()
     res.route_guest_fw_active = c:get(FW_CONFIG, "ts_fix_guest2ts") ~= nil
 
     -- Tailscale0 zone masquerade state — reported active only when BOTH
-    -- families' masquerade are set (mirrors kill_switch_fw_active semantics;
-    -- a torn state surfaces in the UI rather than silently claiming
-    -- protection).
+    -- families' masquerade are set (mirrors kill_switch_fw_active semantics:
+    -- a torn state reports false rather than claiming it; no UI element
+    -- displays this field today).
     res.masquerade_active = c:get(FW_CONFIG, "tailscale0", "masq") == "1"
         and c:get(FW_CONFIG, "tailscale0", "masq6") == "1"
 
@@ -593,8 +596,8 @@ function M.set_config(params)
     -- unknown mode would fail open on any firmware that stops shipping the value.
     --
     -- Disabling is never refused. A user must always be able to take protection down, whatever
-    -- mode the router reports — being stranded behind a kill switch is the failure this project
-    -- exists to avoid.
+    -- mode the router reports — being stranded behind a kill switch is a failure this project
+    -- must never cause.
     local ks_action = nil
     if params.kill_switch ~= nil then
         -- glconfig is none of our packages and may be absent entirely (non-GL firmware, a
@@ -651,7 +654,9 @@ function M.set_config(params)
     -- ts-fix-reapply (which owns the strip logic) and enforced by the watchdog; duplicating
     -- that logic here in a second language would buy nothing. Turning it OFF clears our
     -- ownership record so a later re-enable re-derives from the user's current value rather
-    -- than restoring a stale one; GL puts its suffix back on its next trigger. No spawn is
+    -- than restoring a stale one. GL puts its suffix back the next time it writes it: on 4.9.0
+    -- and 4.11.0 at its next Tailscale restart; on 4.8.4 only after Tailscale is turned off and
+    -- on again (4.8.4 writes it only while its tailnet dnsmasq server line is absent). No spawn is
     -- added here deliberately — the watchdog picks the new preference up within one 5s poll,
     -- exactly as ks_follow_exit_node works.
     if params.hide_ts_domain ~= nil then
@@ -699,9 +704,10 @@ function M.set_config(params)
     if route_changed then
         local rg = c:get(TS_FIX_CONFIG, "settings", "route_guest") == "1"
         update_guest_route(rg)
-        -- Fix policy route: swap Tailscale's "from <guest>" (blocks the exit
-        -- node) with "to <guest>" (allows it). Must run after
-        -- update_guest_route which triggers Tailscale to create its rules.
+        -- Fix policy route: swap GL's "from <guest>" (routes guest around the
+        -- exit node) for "to <guest>" (allows it). The "from" rule is GL's:
+        -- gl_tailscale adds it whenever a Custom Exit Node is set and the guest
+        -- network is enabled. Runs after update_guest_route.
         fix_guest_policy_route(rg)
     end
 

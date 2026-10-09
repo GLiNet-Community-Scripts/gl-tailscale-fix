@@ -90,10 +90,10 @@ teardown_uci_action() {
   /etc/init.d/network reload >/dev/null 2>&1
 }
 
-# GL's own ts_killswitch (4.9). Arm by satisfying its gate then running it; it needs
+# GL's own ts_killswitch (4.9.0, 4.11.0). Arm by satisfying its gate then running it; it needs
 # an exit node configured (exit_node_ip non-empty) + run_exit_node!=1 to actually arm.
 arm_gl_tskillswitch() {
-  [ -x /usr/bin/ts_killswitch ] || { echo "  /usr/bin/ts_killswitch absent (not 4.9?)"; return 1; }
+  [ -x /usr/bin/ts_killswitch ] || { echo "  /usr/bin/ts_killswitch absent (GL 4.8.4 has none)"; return 1; }
   [ -n "$(uci -q get tailscale.settings.exit_node_ip)" ] || \
     echo "  WARN: exit_node_ip empty — GL will NOT arm. Set a Custom Exit Node first."
   uci -q set tailscale.settings.killswitch=1; uci commit tailscale

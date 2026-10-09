@@ -17,9 +17,9 @@ mkdir -p "$TSFX_RESULTS"
 : "${V6_URLS:=https://v6.ident.me https://api6.ipify.org}"
 : "${SSH_OPTS:=-o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -o BatchMode=yes}"
 
-# Always pass TARGET explicitly per run (your router's LAN IP). The suite was
-# validated on fw4/4.8.x and fw3/4.9.x GL routers, including runs where the
-# monitored laptop sat behind the router under test.
+# Always pass TARGET explicitly per run (your router's LAN IP). The suite was validated on GL
+# firmware 4.8.4 (fw4), 4.9.0 and 4.11.0 (both fw3), including runs where the monitored laptop
+# sat behind the router under test.
 
 # Capture the laptop's current public egress for a family (the tunnel baseline).
 #   $1 = -4|-6 ; prints IP or empty

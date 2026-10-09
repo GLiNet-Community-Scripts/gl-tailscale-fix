@@ -220,7 +220,8 @@ do_install() {
 
     set_status "running" "Checking disk space..."
 
-    # Check free space (combined binary is ~6MB, need margin for download)
+    # Check free space where the binary will live: refuse below 5 MB. The download goes to /tmp;
+    # the binary is ~6 MB (see the download step), so this floor alone does not guarantee room.
     local free_kb
     free_kb=$(df /usr/sbin/ | tail -1 | awk '{print $4}')
     if [ "$free_kb" -lt 5120 ]; then

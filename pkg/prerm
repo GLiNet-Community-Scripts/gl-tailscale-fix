@@ -54,9 +54,10 @@ cp /etc/config/ts-fix /tmp/ts-fix-config.saved 2>/dev/null
 rm -f /etc/hotplug.d/iface/20-ts-fix /etc/hotplug.d/iface/10-ts-fix-ks \
       /etc/hotplug.d/iface/98-ts-fix-isolate6 2>/dev/null
 
-#   2. boot guard — KILLED BEFORE the service stop below, for two reasons. First, it is a
-#      DETACHED orphan subshell (procd does not track it; a stop cannot reach it) that
-#      watches `ip monitor rule` for up to 180s after any armed service start and re-asserts
+#   2. boot guard of the v1.0.22 dev builds (the released init script spawns none) — KILLED
+#      BEFORE the service stop below, for two reasons. First, it is a DETACHED orphan subshell
+#      (procd does not track it; a stop cannot reach it) that watches `ip monitor rule` for up
+#      to 180s after any armed service start and re-asserts
 #      the 5279 rules within MILLISECONDS of a deletion event — left alive it deterministically
 #      reverts this script's own rule teardown (the intent UCI it gates on is only deleted at
 #      the end of this script): a stranded armed kill switch with no package behind it.
@@ -78,7 +79,7 @@ rm -f /etc/hotplug.d/iface/20-ts-fix /etc/hotplug.d/iface/10-ts-fix-ks \
 kill $(pgrep -f 'ip monitor rul[e]' 2>/dev/null) 2>/dev/null
 rm -f /tmp/ts-fix-bootguard.lock /tmp/ts-fix-bootguard.ready 2>/dev/null
 
-# Stop and disable procd service (removes UCI reload trigger)
+# Stop and disable the procd service (the watchdog)
 if [ -x /etc/init.d/ts-fix ]; then
     /etc/init.d/ts-fix stop 2>/dev/null
     /etc/init.d/ts-fix disable 2>/dev/null
@@ -98,10 +99,11 @@ rm -f /etc/rc.d/S18ts-fix-preboot 2>/dev/null
 kill $(pgrep -f 'ts-fix-watchdo[g]' 2>/dev/null) 2>/dev/null
 
 #   4. in-flight reapply drain — procd's TERM stops the watchdog SHELL, but a reapply it (or
-#      hotplug, or the RPC) had already spawned survives as an orphan and completes. Worst
-#      case it parks ~93s holding the engine lock (sleep 3 + 60s gl_tailscale wait + 30s
-#      Running wait), then writes firewall/UCI/daemon state AFTER the teardown below has
-#      swept. Bounded 100s wait covers that natural ceiling; a straggler still alive after it
+#      hotplug) had already spawned survives as an orphan and completes. It can park ~93s
+#      holding reapply's own lock, /tmp/ts-fix-reapply.lock (sleep 3 + 60s gl_tailscale wait +
+#      30 Running tries, each up to 11s when a status call hangs), then writes firewall/UCI/daemon
+#      state AFTER the teardown below has swept. The bounded 100s wait covers the usual ~93s; a
+#      straggler still alive after it
 #      is killed — its pre-park writes (KS install, masq6) happen before the waits and are
 #      removed by the teardown that follows this drain.
 _i=0

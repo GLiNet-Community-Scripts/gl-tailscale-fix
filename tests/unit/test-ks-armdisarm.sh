@@ -1407,7 +1407,8 @@ if cmp -s "$T/before" "$STATE"; then ok "4b state unchanged"; else nok "4b state
 is "4b zero commits"                   "" "$(commits)"
 is "4b zero reloads"                   0 "$(reloads)"
 is "4b silent log"                     "" "$(logtext)"
-# The poll's whole ip cost: the invariant's two default-route reads, then the rule layer's four.
+# The poll's whole ip cost: the invariant's two default-route reads, then the rule layer's six
+# (four rule and route reads, two swap reads).
 is "4b ip calls: 2 route reads + the rule layer's 6 (4 rules/routes, 2 swap)" "-4 route show default
 -6 route show default
 $(ensure_expect_present)" "$(ipcalls)"
@@ -4677,7 +4678,7 @@ is "17b the lock was held throughout (non-vacuity)" yes "$held"
 is "17b rc"                            0 "$rc"
 if [ "$took" -le 1 ]; then ok "17b returned without waiting (${took}s)"
 else nok "17b returned without waiting" "<= 1s" "${took}s"; fi
-# The copy differs from the engine only in its three path lines, so it probes the host's own
+# The copy differs from the engine only in its five path lines, so it probes the host's own
 # /proc/sys/net/ipv6. Its ip stub prints nothing, so the swap finds no bridge address and adds none.
 if [ -d /proc/sys/net/ipv6 ]; then want_rules=6 want_routes=2; else want_rules=3 want_routes=1; fi
 is "17b did the rule-layer work: $want_rules rule adds" "$want_rules" "$(grep -c ' rule add ' "$T/bin2-ip-calls")"

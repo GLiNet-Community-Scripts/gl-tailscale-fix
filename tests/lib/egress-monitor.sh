@@ -15,7 +15,8 @@
 #   blocked = no usable response (KS holding — also the desired result)
 #   LEAK    = some other public IP answered (real address exposed)
 # If no tunnel baseline is supplied for a family, ANY response on that family is
-# treated as a LEAK and no-response as ok (correct privacy stance).
+# treated as a LEAK and no-response as blocked (correct privacy stance). Without a v4 baseline no
+# sample is ever "ok", so such a run can only end LEAK or INCONCLUSIVE.
 #
 # TWO-LAYER KILL SWITCH — what "blocked" looks like on the wire depends on which
 # layer stops the packet, while the leak semantics above do NOT. Neither layer

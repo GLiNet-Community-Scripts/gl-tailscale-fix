@@ -14,8 +14,9 @@
 #               GL's `lookup 1002` never counts; `[detached]` counts) AND table 100's `unreachable
 #               default` present AND no rule ahead of 5279 sending that bridge's traffic to main
 #               (sh_* = 0). GL adds exactly such a rule — `from <net> lookup main`, priority 0 — for
-#               guest and iot whenever a Custom Exit Node is set; while it stands the rule layer does
-#               not protect that bridge, and the engine swaps it for `to <net> lookup main`.
+#               guest (4.8.4) and for guest and iot (4.9.0 and later) whenever a Custom Exit Node is
+#               set and that network is enabled; while it stands the rule layer does not protect that
+#               bridge, and the engine swaps it for `to <net> lookup main`.
 #   zone layer  FORWARD policy DROP AND zone_<zone>_forward present AND no ACCEPT path from it into
 #               a watched zone (netfilter, fw3) AND no recorded pair of that zone re-enabled in UCI.
 # Each layer survives the other's eraser: a firewall restart flushes netfilter to policy ACCEPT
@@ -40,9 +41,11 @@
 #                              nft is not read here, so on fw4 only the UCI half of the zone layer
 #                              is sampled and a flush is invisible to this sampler
 #   t52_4 t52_6 wan_def daemon backend exitnodeid uci_exit_ip   context
-#   gl_ks4 gl_ks6 gl9920_4 gl9920_6   GL's OWN blackholes (5280 = 4.9's ts_killswitch, IPv4 + br-lan
-#                              only; 9920 = its VPN-client leak block). Not ours: kept because a clean
-#                              run with one of them up cannot be credited to our kill switch alone
+#   gl_ks4 gl_ks6 gl9920_4 gl9920_6   GL's OWN blackholes (5280 = GL's ts_killswitch on 4.9.0 and
+#                              4.11.0 (4.8.4 has none): one IPv4 rule for the main LAN (br-lan) only,
+#                              never IPv6, guest or IoT; 9920 = its VPN-client leak block). Not ours:
+#                              kept because a clean run with one of them up cannot be credited to our
+#                              kill switch alone
 #   watch nets4 zones          the watched zone set, the source-zone networks and which of
 #                              lan/guest/iot exist as firewall zones — derived once at start
 # NA = not sampled. ERR = sampled but the dump failed; ERR never counts as protected.

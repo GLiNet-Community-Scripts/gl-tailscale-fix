@@ -1,6 +1,7 @@
 #!/bin/sh
 # gl-tailscale-fix: Re-apply settings after GL's "tailscale up --reset"
-# Called by procd reload trigger (uci commit tailscale) and hotplug (ifup).
+# Called by hotplug 20-ts-fix (ifup), the watchdog and postinst; procd reload
+# triggers do not fire on GL firmware.
 # Waits for GL's gl_tailscale restart to finish, then re-applies exit node,
 # guest routes, firewall forwardings, and the two-layer kill switch (owned
 # entirely by /usr/bin/ts-fix-ks).
@@ -24,9 +25,10 @@ command -v timeout >/dev/null 2>&1 || timeout() { shift; "$@"; }
 
 # Firmware detection — on GL 4.9+, some features overlap with GL's native
 # Tailscale enhancements. We keep the plugin fully active (kill switch, guest
-# routing, SSH, Version Manager, masquerade) but skip operations that would
-# fight GL's native layer (specifically: tailscale set --advertise-exit-node,
-# which GL manages via run_exit_node UCI on 4.9+).
+# routing, SSH, Version Manager, tailscale0 masq6) but skip what would fight
+# GL's native layer: tailscale set --advertise-exit-node (GL manages it via
+# run_exit_node UCI), the IPv4 tailscale0 masq (GL's IP Masquerading toggle
+# owns it) and the wan.masq6 exit-node backstop.
 is_fw49_plus() {
     local fw_ver major minor
     fw_ver=$(awk '{print $1}' /etc/glversion 2>/dev/null)
@@ -112,9 +114,9 @@ ensure_wan_v6_masq_for_exit_node() {
 # Strip Tailscale tailnet tokens out of a dnsmasq "domain" value.
 #
 # GL writes the tailnet MagicDNS suffix into dhcp.@dnsmasq[0].domain, which dnsmasq then
-# advertises to LAN clients. 4.8 APPENDS it ("<suffix> <original>"); 4.9 REPLACES the value
-# outright ("<suffix>"). This removes any tailnet token from either shape and echoes the
-# remainder, which may legitimately be empty (the 4.9 case — the caller falls back).
+# advertises to LAN clients. 4.8 PREPENDS it ("<suffix> <original>"); 4.9 and 4.11 REPLACE the
+# value outright ("<suffix>"). This removes any tailnet token from either shape and echoes the
+# remainder, which may legitimately be empty (the 4.9/4.11 case — the caller falls back).
 #
 # Matches a bare "ts.net" as well as "*.ts.net": gl_tailscale falls back to dns_suffix="ts.net"
 # when the daemon returns no MagicDNS suffix, and a suffix-only match would silently leave the
@@ -183,8 +185,9 @@ route_list_drop() {
 # `uci -q get` prints nothing and returns 1 both for an absent option and for a read that failed,
 # so it cannot tell "off" from "unknown", and a failed read taken for "off" tears protection down.
 # `uci -q show <pkg>.settings` can: a readable section prints its own "<pkg>.settings=<type>" line
-# first, and a failed read prints nothing. An option absent from a readable section is off (GL's
-# slider accessory deletes tailscale.settings.enabled to restore its never-set state); a failed read
+# first, and a failed read prints nothing. An option absent from a readable section is off (the
+# side-switch accessory, accessories/gl-switch.d/tailscale.sh, deletes tailscale.settings.enabled
+# to restore its never-set state); a failed read
 # is UNKNOWN, and no caller may act on it as off. Shell matching only: no fork beyond the uci call.
 #
 # ts_state — tailscale.settings, read once: ts_en is 1 when it holds enabled='1', 0 for any other
@@ -252,9 +255,10 @@ fi
 # be cleaned up, and UCI settings reset to 0 so everything starts clean
 # when Tailscale is re-enabled.
 if [ "$ts_en" = "0" ]; then
-    # Hand the kill switch back to its engine: it re-enables exactly the forwardings we severed and
-    # clears any RPDB-era rules an older install left behind. A failure here leaves LAN/guest/IoT
-    # egress severed, so say so loudly — the UCI reset below must not read as "all clean".
+    # Hand the kill switch back to its engine: it takes the rule layer down (the 5279 rules, the
+    # table-100 route, the guest/iot source-rule swap, and any 5280 rules from before v1.0.21) and
+    # re-enables exactly the forwardings we severed. A failure here leaves LAN/guest/IoT egress
+    # severed, so say so loudly — the UCI reset below must not read as "all clean".
     /usr/bin/ts-fix-ks disarm || logger -t ts-fix "teardown: ts-fix-ks disarm reported failure (rc $?) - severed state may need a manual ts-fix-ks disarm"
 
     # Remove guest policy route fixup
@@ -337,7 +341,7 @@ if [ "$ts_en" = "0" ]; then
     exit 0
 fi
 
-# Prevent concurrent runs (shared with hotplug and procd trigger)
+# Prevent concurrent runs (hotplug, the watchdog and postinst all start this script)
 LOCK="/tmp/ts-fix-reapply.lock"
 exec 200>"$LOCK"
 flock -n 200 || exit 0
@@ -358,18 +362,20 @@ flock -n 200 || exit 0
 #
 # Design C is unchanged: armed iff the user's kill_switch intent is on AND Tailscale is enabled
 # (the teardown above handles a user disable). Nothing reads exit-node state, so the daemon's
-# transient or stale ExitNodeID can neither arm nor disarm it — fail-secure: block, never leak the
-# real IP. Only a kill_switch=0 toggle or a Tailscale disable takes it down.
+# transient or stale ExitNodeID can neither arm nor disarm it — fail-secure: block rather than
+# leak the real IP. Only a kill_switch=0 toggle or a Tailscale disable takes it down.
 #
 # kill_switch is read the three-state way (ks_state, above). A read that failed is neither arm nor
 # disarm: one ERROR, and the kill switch is left exactly as it is — the engine's own check, on the
 # watchdog's next poll, reads intent itself and is the authority. Taking it for "off" used to
 # disarm an armed router.
 #
-# Established flows are carried by masq/masq6 rather than by anything here: on interface death
-# masquerade's device-down handler purges its conntrack entries, and on exit-node clear tailscaled's
-# own config-change cleanup purges them (device-measured on fw3 2026-08-17; fw4 re-proof is a ship
-# gate). Applied HERE, before the daemon waits below, because arming needs no daemon state at all.
+# Established flows: on interface death masquerade's device-down handler purges its conntrack
+# entries, and on exit-node clear tailscaled's own config-change cleanup purges them
+# (device-measured on fw3 2026-08-17); a flow still routed once table 52 has no default hits the
+# rule layer armed here (measured; the engine's header has the firmwares, the families and the
+# offload exception). Applied HERE, before the daemon waits below, because arming needs no daemon
+# state at all.
 ks_state
 if [ -z "$ks_on" ]; then
     logger -t ts-fix "ERROR reapply: ts-fix.settings could not be read - kill switch left as it is (neither armed nor disarmed); the engine's check is the authority"
@@ -395,19 +401,20 @@ fi
 # GL writes the tailnet MagicDNS suffix into dhcp.@dnsmasq[0].domain, which dnsmasq advertises
 # to DHCP clients — so every LAN device, including a corporate-managed laptop, receives
 # "<tailnet>.ts.net" as its domain/search suffix. That is a passive signal that the machine sits
-# behind a Tailscale node. It also breaks local .lan resolution on 4.9, where GL REPLACES the
-# value rather than appending to it (expandhosts then qualifies hostnames into the tailnet
-# domain instead of the user's).
+# behind a Tailscale node. It also breaks local .lan resolution: with GL's suffix in place, DHCP
+# clients' .lan names stop resolving on 4.8.4, 4.9.0 and 4.11.0 (tested 2026-10-09). 4.8 prepends
+# the suffix ("<suffix> lan"); 4.9 and 4.11 replace the local domain, and expandhosts then
+# qualifies hostnames into the tailnet domain instead of the user's.
 #
 # We take ownership of that one value. /etc/dnsmasq.conf's "server=/…/100.100.100.100" entry is
 # deliberately untouched, so an explicit tailnet FQDN still resolves — only the broadcast hint
-# goes away. gl_tailscale is the sole writer of this field on both firmwares (verified), so this
-# is the only place we have to contest.
+# goes away. gl_tailscale is the sole writer of this field on 4.8.4 and 4.9.0 (verified
+# 2026-08-02; 4.11.0 not re-checked), so this is the only place we have to contest.
 #
 # REACTIVE, never authoritative: we only ever strip a tailnet token, never impose a remembered
 # value over one the user has since chosen. Enforcing a value cached at first-enable would fight
 # a user who later edited their local domain in LuCI — we would keep writing the old one back
-# over their edit. user_domain is therefore a fallback for the 4.9 replace case only, and it is
+# over their edit. user_domain is therefore a fallback for the 4.9/4.11 replace case only, and it is
 # refreshed from whatever clean value the user currently has.
 #
 # Applied here, before the daemon waits below, because it needs no daemon state at all.
@@ -424,7 +431,7 @@ if [ "$hide_ts_domain" = "1" ]; then
             uci commit ts-fix
         fi
     else
-        # A tailnet token was present. If stripping leaves nothing, this is the 4.9 replace
+        # A tailnet token was present. If stripping leaves nothing, this is the 4.9/4.11 replace
         # case — fall back to our recorded value, then GL's own saved sidecar, then "lan".
         if [ -z "$want" ]; then
             want=$(uci -q get ts-fix.settings.user_domain)
@@ -484,8 +491,9 @@ while [ $i -lt 60 ]; do
     i=$((i + 1))
 done
 
-# GL's chain re-adds its guest/iot "from <net> lookup main" rule at its very end, after its firewall
-# restart, and that rule routes guest/iot traffic past the kill switch's priority-5279 rules until
+# GL's chain re-adds its "from <net> lookup main" rule (guest; from 4.9.0 also iot) at its very end,
+# after its firewall restart where it runs one, and that rule routes guest/iot traffic past the
+# kill switch's priority-5279 rules until
 # the engine swaps it out again. The watchdog's next pass cannot be counted on for that: it may be
 # parked in this very script. So re-assert the rule layer now, within about a second of the chain
 # ending. rules-ensure takes no lock and self-gates on armed intent and Router mode, so on a
@@ -669,9 +677,10 @@ fi
 
 # Fix guest subnet policy route for exit node compatibility.
 # GL's gl_tailscale adds "from <guest_subnet> lookup main" at priority 0
-# whenever a Custom Exit Node is set and the guest network is enabled. This
-# blocks guest clients from using the exit node. Replace with "to
-# <guest_subnet>" (destination-based, the shape of GL's own LAN rule).
+# whenever a Custom Exit Node is set and the guest network is enabled. That
+# sends guest traffic through the main table to the real uplink, around the
+# exit node and any kill-switch rule. Replace with "to <guest_subnet>"
+# (destination-based, the shape of GL's own LAN rule).
 if [ "$route_guest" = "1" ] && [ -n "$guest_subnet" ]; then
     ip rule del from "$guest_subnet" lookup main 2>/dev/null
     ip rule del to "$guest_subnet" table main 2>/dev/null

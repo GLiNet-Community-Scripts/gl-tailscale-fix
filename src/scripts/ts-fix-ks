@@ -7,15 +7,16 @@
 #   src:dest pairs in the ts-fix.settings.ks_severed sidecar for exact restore) and lan ->
 #   tailscale0 is ensured. It lives in flash-persisted UCI that the firewall re-emits at every
 #   lifecycle event, with no dependency on tailscaled being alive. Its eraser is a firewall
-#   RESTART, which flushes netfilter and leaves forwarding open for 0.2-1.6 s (measured on fw3);
-#   GL issues such restarts itself.
+#   RESTART, which flushes netfilter and leaves forwarding open for 0.2-1.6 s on fw3 and ~0.5 s
+#   on fw4 (both measured); GL issues such restarts itself.
 #
 #   Rule layer — per family (IPv6 only where the kernel has an IPv6 stack, see KS_IPV6_PROC),
 #   "iif br-lan|br-guest|br-iot priority 5279 lookup 100" (the KS_RULE_* constants) in front of
 #   an "unreachable default" route in table 100. Tailscale's exit-node rule (5270 -> table 52) is
 #   consulted first, so forwarded traffic leaves through the tunnel while the exit node is up and
 #   falls through to the unreachable route once table 52 has lost its default. A firewall restart
-#   does not touch routing policy (by mechanism; not yet measured on device). Its eraser is
+#   does not touch routing policy (measured on fw4: the rules and the table-100 route held through
+#   two restarts, GL-AXT1800 4.8.4, 2026-10-03). Its eraser is
 #   netifd's start (boot, network restart), which wipes every policy rule and leaves the UCI zone
 #   layer standing.
 #
@@ -49,10 +50,14 @@
 # conntrack. The zone layer's established-flow safety is carried by masq (GL forces it in
 # exit-node configs) plus masq6 (plugin-owned): on interface death masquerade's device-down
 # handler purges its conntrack entries, and on exit-node clear tailscaled's own config-change
-# cleanup purges them. Both device-measured on fw3 2026-08-17; fw4 re-proof is a ship gate. The
-# rule layer does not rely on that purge: a forwarded packet is routed before FORWARD's conntrack
-# accept, so once table 52 has lost its default an established flow is expected to hit the
-# unreachable route like any other. That is not yet measured; it is to be proven on device.
+# cleanup purges them. Both device-measured on fw3 2026-08-17. The rule layer does not rely on
+# that purge: a forwarded packet is routed before FORWARD's conntrack accept, so once table 52 has
+# lost its default an established flow hits the unreachable route like any other. Measured with a
+# flow already running when the kill switch was armed with the exit node down: on GL-AXT1800 4.8.4
+# (fw4, 2026-10-03) it stopped within ~3 s in both families, where the zone layer alone stopped only
+# new flows. On GL-MT3000 4.11.0 (fw3, 2026-09-30) an IPv6 flow stopped within ~2 s. The exception
+# is a flow the MediaTek offload engine bound before arming, which keeps flowing (README, Hardware
+# offload).
 # Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
 # https://github.com/RemoteToHome-io/gl-tailscale-fix
 
@@ -445,8 +450,9 @@ _ks_src_covered() { ks_pair_in "$KS_SRC_ZONES" "$1"; }
 # SCOPE — the src zones in KS_SRC_ZONES: lan, guest and iot. lan and guest are what the kill switch
 # has always covered. GL creates the iot network itself since firmware 4.9.0, from a ROM
 # uci-default (01_gl_iot-network; disabled by default, absent on 4.8.4), and treats it as
-# LAN-class — its own VPN kill switch blackholes br-iot — so it is covered like guest. While armed,
-# guest and iot reach the internet only through the exit node, never the real uplink: through
+# LAN-class — its VPN-client kill switch blackholes br-iot, though its Tailscale kill switch covers
+# br-lan only — so it is covered like guest. While armed,
+# guest and iot reach the internet only through the exit node, not the real uplink: through
 # Tailscale's own forward rules while those are in place (guest also through Route Guest's
 # forwarding when that is on), and otherwise not at all — blocked, not leaked (see
 # _ks_ensure_lan2ts). Any other source zone — one the user created — is deliberately NOT severed:
@@ -785,8 +791,8 @@ _ks_invariant() {
 #
 # Both refusal paths — no intent, or a mode this build refuses — take the rule layer down. Nothing
 # is armed there, so rules left in place would only blackhole the LAN with nothing coming to clear
-# them: an upgrading v1.0.22 router carries live 5279 rules and the table-100 route, and the build
-# that installed them may not have refused the mode this one does.
+# them: a router upgrading from v1.0.21 carries live 5279 rules and the table-100 route, and
+# v1.0.21 refused no router mode.
 #
 # An intent that cannot be read is neither: one ERROR, rc 1, and nothing armed, written or removed.
 # Removing the rule layer there would turn a failed read into a disarm.
@@ -993,7 +999,8 @@ ks_disarm() {
 # tunnel path present, run the runtime invariant, then assert the rule layer. Commits and reloads
 # happen only when something actually changed, or when a previous commit failed and still needs
 # retrying; a previous reload that failed is retried on its own, with no commit. A rule layer
-# already in place, swap included, costs six `ip` reads and one ipcalc per guest/iot bridge that
+# already in place, swap included, costs six `ip` reads (four without an IPv6 stack) and one ipcalc
+# per guest/iot bridge that
 # has an address, and nothing more.
 #
 # An intent that cannot be read (_ks_intent rc 2) is neither branch: check holds, rc 1, and changes
@@ -1155,8 +1162,9 @@ _ks_route_present() {
 
 # _ks_rules_ensure — idempotently install the rule layer in every family _ks_fams_now yields, then
 # the source-rule swap (_ks_swap_ensure). Per family it reads the KS_RULE_PRIO rules once and table
-# KS_RULE_TABLE once and adds only what is missing, so a layer already in place costs exactly six
-# `ip` reads — those four and the swap's two — plus one ipcalc per guest/iot bridge that has an
+# KS_RULE_TABLE once and adds only what is missing, so a layer already in place costs six `ip`
+# reads — those four (two without an IPv6 stack) and the swap's two — plus one ipcalc per
+# guest/iot bridge that has an
 # address (armed, the watchdog runs this every 5s). One log line names what was added, and only
 # when something was; the swap logs its own.
 #
@@ -1205,8 +1213,9 @@ _ks_rules_ensure() {
 }
 
 # _ks_rules_del <family> <priority> — delete our rule for every KS_RULE_IIFS bridge at that
-# priority. Every delete is action-qualified "lookup KS_RULE_TABLE", so GL 4.9's own kill switch, a
-# blackhole rule at 5280 with no table, is never touched. Each delete repeats until it fails, at
+# priority. Every delete is action-qualified "lookup KS_RULE_TABLE", so GL's own Tailscale kill
+# switch (4.9.0 and 4.11.0; none on 4.8.4), a blackhole rule at 5280 with no table, is never
+# touched. Each delete repeats until it fails, at
 # most 5 times: a kernel that accepts an identical rule twice can hold a twin — from two concurrent
 # ensures there, or already present — and a single delete would leave it. A kernel that refuses
 # identical adds (EEXIST) never creates one, and there the second attempt simply fails.

@@ -18,7 +18,8 @@
 #               ACCEPT for a moment (0.2-1.6 s in Phase M, 2026-09-05); GL's gl_tailscale
 #               restart runs one on 4.9+.
 # This leg's reset window can hit either eraser. `start` refuses a router on which EITHER
-# layer is not armed; `analyze` applies the combined predicate to every router sample.
+# layer is not armed; `analyze` applies the combined predicate to every router sample taken with
+# armed intent (uci_ks=1), on two-layer sampler artifacts.
 # The laptop-side leak verdict remains the authority: any non-tunnel public IP is a LEAK.
 #
 # This script is a TEMPLATE for the other failure modes: a "start" phase that

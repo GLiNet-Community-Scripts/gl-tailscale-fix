@@ -144,9 +144,11 @@ if [ "$is_fw49_plus" = "1" ]; then
 fi
 
 # Enable and (re)start the procd service (runs watchdog on every firmware
-# version). Under the zone kill switch there is nothing left to install ahead
-# of netifd — enforcement is flash-persisted firewall UCI that comes up with
-# the firewall's own boot — so START is back at the stock 99. The v1.0.22 dev
+# version). Under the two-layer kill switch there is nothing left to install
+# ahead of netifd — the zone layer is flash-persisted firewall UCI that comes up
+# with the firewall's own boot, and netifd's start wipes the rule layer anyway
+# (the 10-ts-fix-ks hotplug handler re-installs it after) — so START is back at
+# the stock 99. The v1.0.22 dev
 # builds ran the init script at START=19 for the RPDB-era boot guard, so remove
 # a stale S19 symlink first: enable only creates the S99 link, it does not
 # clean up differently-numbered leftovers, and a surviving S19 would run the
@@ -188,8 +190,9 @@ fi
 # `uci -q get` prints nothing and returns 1 both for an absent option and for a read that failed,
 # so it cannot tell "off" from "unknown", and a failed read taken for "off" tears protection down.
 # `uci -q show <pkg>.settings` can: a readable section prints its own "<pkg>.settings=<type>" line
-# first, and a failed read prints nothing. An option absent from a readable section is off (GL's
-# slider accessory deletes tailscale.settings.enabled to restore its never-set state); a failed read
+# first, and a failed read prints nothing. An option absent from a readable section is off (the
+# side-switch accessory, accessories/gl-switch.d/tailscale.sh, deletes tailscale.settings.enabled
+# to restore its never-set state); a failed read
 # is UNKNOWN, and no caller may act on it as off. Shell matching only: no fork beyond the uci call.
 #
 # ts_state — tailscale.settings, read once: ts_en is 1 when it holds enabled='1', 0 for any other
@@ -245,7 +248,7 @@ ks_state() {
 # that the config restore above put in place (committed state — the engine
 # reads UCI, so it must be settled before either call).
 #
-# Armed router upgrading from an earlier build: arm severs the lan/guest egress
+# Armed router upgrading from an earlier build: arm severs the lan/guest/iot egress
 # forwardings and commits them, then ensures the rule layer — the priority-5279
 # rules and the table-100 unreachable route, which are the CURRENT rule layer
 # and are kept, not dropped (a v1.0.21 or RPDB-era v1.0.22 router arrives with
@@ -297,7 +300,7 @@ if [ -x /usr/bin/ts-fix-ks ]; then
         /usr/bin/ts-fix-ks rules-clean || logger -t ts-fix "postinst: ts-fix-ks rules-clean rc $? - kill-switch rule-layer rules may remain; watchdog check will retry"
     fi
 else
-    logger -t ts-fix "postinst: /usr/bin/ts-fix-ks missing - zone kill switch NOT migrated (broken install?)"
+    logger -t ts-fix "postinst: /usr/bin/ts-fix-ks missing - kill switch NOT converged (broken install?)"
 fi
 
 # Sanity-check installed UI artifacts against the package version. A silent
