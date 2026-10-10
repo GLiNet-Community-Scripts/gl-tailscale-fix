@@ -259,9 +259,9 @@ We do **not** assume a block mechanism works because GL uses it. Each candidate 
 
 GL-`ts_killswitch` efficacy needs a 4.9.0 or 4.11.0 router (GL's script is identical on both;
 absent on 4.8.4) with a Custom Exit Node set and the
-laptop behind it. **To verify (unconfirmed):** netifd honors `action`/`rule6` on fw3+fw4;
-`in=lan`/`guest` → `iif br-lan`/`br-guest` (check `show` — the guest UCI iface name may differ);
-whether `/etc/init.d/network reload` opens a transient gap.
+laptop behind it. **Confirmed:** GL's `in='lan'` rule shows as `from all iif br-lan blackhole` at
+priority 5280 (IPv4 only). **Still to verify:** whether `/etc/init.d/network reload` opens a
+transient gap.
 
 ## Status
 

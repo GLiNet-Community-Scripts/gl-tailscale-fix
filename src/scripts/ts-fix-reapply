@@ -248,7 +248,7 @@ if [ -z "$ts_en" ]; then
     exit 1
 fi
 
-# If Tailscale is disabled — enabled '0', or the option absent, as GL's slider leaves it — tear
+# If Tailscale is disabled — enabled '0', or the option absent, as the side-switch accessory leaves it — tear
 # down all ts-fix state and exit.
 # This covers the case where a user disables Tailscale while our switches
 # are active — the kill switch, firewall forwardings, and policy routes must

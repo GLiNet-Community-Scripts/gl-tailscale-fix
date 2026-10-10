@@ -1962,7 +1962,7 @@ is "U6 enabled '0': rc 0, disarmed as before (lost-disarm path)" "0 1" "$rc $(g 
 is "U6 ... record dropped, rule layer gone" ":" "$(sev):$(grep -v '^S|' "$IPSTATE")"
 has "U6 ... the lost-disarm line"      "a disarm was lost" "$(logtext)"
 u_armed
-uci -q delete tailscale.settings.enabled    # GL's slider deletes it to restore a never-set state
+uci -q delete tailscale.settings.enabled    # the side-switch accessory deletes it to restore a never-set state
 is "U6 non-vacuity: the section is still readable, with no enabled option" "tailscale.settings=settings|" \
     "$(uci -q show tailscale.settings | head -n 1)|$(uci -q show tailscale.settings | grep -e '\.enabled=')"
 ks_main check > "$T/out" 2>&1; rc=$?

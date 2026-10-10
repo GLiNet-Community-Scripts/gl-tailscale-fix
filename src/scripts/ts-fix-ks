@@ -335,7 +335,7 @@ _ks_optv() {
 # the section's own "<pkg>.settings=<type>" line first whenever the section could be read; output
 # that does not start with that line is a failed read, and the answer is 2, on which every caller
 # holds and changes nothing. In a readable section an option is on only as exactly '1'; any other
-# value, or none at all, is off — GL's slider accessory deletes tailscale.settings.enabled to
+# value, or none at all, is off — the plugin's side-switch accessory deletes tailscale.settings.enabled to
 # restore its never-set state. So rc 1 means both reads succeeded. The values as read are left in
 # _ks_intent_ks and _ks_intent_en (as uci prints them, empty when absent), and the sections that
 # could not be read in _ks_unread. The scripts outside the engine read intent the same way through

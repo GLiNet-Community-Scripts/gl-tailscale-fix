@@ -5,9 +5,10 @@
 # ############################################################################################
 # RETIRED with the two-layer kill switch — kept for the record, not for the current build.
 #
-# It samples the routing layer only: the priority-5279 rules and the table-100 unreachable
-# default. In the v1.0.12-v1.0.21 releases (and the RPDB-era v1.0.22 dev builds) that layer was
-# the whole kill switch, and netifd's start flushes the entire policy rulebase, so there was a gap
+# It samples the routing layer only: its rules (priority 5280 through v1.0.20, 5279 from v1.0.21)
+# and the table-100 unreachable default. In the v1.0.12-v1.0.21 releases (and the RPDB-era
+# v1.0.22 dev builds) that layer was the whole kill switch, and netifd's start flushes the entire
+# policy rulebase, so there was a gap
 # before the rules were re-asserted: on a GL-MT3000 on 4.9.0, v1.0.21 installed them 10.85 s after
 # the router's internet route appeared (22.2 s on a second boot), before the S19 + netlink-guard
 # fix. In the one boot watched from a LAN client, IPv6 traffic reached the internet in that gap

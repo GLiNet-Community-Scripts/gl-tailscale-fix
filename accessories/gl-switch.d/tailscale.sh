@@ -433,7 +433,7 @@ switch_off() {
 
     # GL firmware 4.9.0 and 4.11.0 keep their own IPv4 kill switch for the main LAN
     # (network.ts_block_lan_leak, a priority-5280 blackhole) armed while Tailscale is enabled with
-    # an exit node set (and the router is not itself an exit node), and only GL's own
+    # an exit node set (the router not itself an exit node, and GL's killswitch setting not 0), and only GL's own
     # Tailscale settings path re-evaluates that rule — this path deliberately goes around that
     # (see above), so run GL's own evaluator directly. With Tailscale now disabled it removes
     # the rule; where the file doesn't exist (pre-4.9) this is a no-op.

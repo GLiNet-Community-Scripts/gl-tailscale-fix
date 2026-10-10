@@ -482,7 +482,8 @@ function M.get_config()
     -- nginx restart).
     res.ts_version = get_ts_version()
 
-    -- Kill switch state. Both kill-switch layers are owned entirely by /usr/bin/ts-fix-ks, and
+    -- Kill switch state. Both kill-switch layers are owned by /usr/bin/ts-fix-ks (the Route Guest
+    -- fix, fix_guest_policy_route above, also deletes and re-adds the engine's guest rule), and
     -- this reads only the zone layer (the priority-5279 rule layer is not checked here), so it
     -- only VERIFIES the engine's own record: every src:dest
     -- pair listed in the ks_severed sidecar must still have a disabled forwarding behind

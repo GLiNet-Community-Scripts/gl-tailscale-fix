@@ -372,7 +372,7 @@ is "B ... exactly one uci call: the show" "uci -q show tailscale.settings" "$(ca
 st_reset; sec tailscale.settings settings enabled=0 exit_node_ip=192.0.2.7
 is "B enabled '0': off" "0 en=[0] eip=[192.0.2.7]" "$(tsr)"
 st_reset; sec tailscale.settings settings lan_enabled=1
-is "B enabled ABSENT in a readable section: off, not unknown (GL's slider deletes it)" "0 en=[0] eip=[]" "$(tsr)"
+is "B enabled ABSENT in a readable section: off, not unknown (the side-switch accessory deletes it)" "0 en=[0] eip=[]" "$(tsr)"
 for v in true yes on 01 '1 ' ' 1' 11; do
     st_reset; sec tailscale.settings settings "enabled=$v"
     is "B enabled '$v': off (only '1' is on)" "0 en=[0] eip=[]" "$(tsr)"
