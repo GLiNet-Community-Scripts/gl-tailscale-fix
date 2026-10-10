@@ -27,8 +27,9 @@
 
 # Procd service symlink (auto-start after sysupgrade). Only the S symlink exists —
 # the init script declares no STOP=, so enable never creates a K symlink.
-# S99 matches START=99 in the init script: the zone kill switch is applied from flash by
-# the firewall's own boot, so nothing here needs to precede netifd any more.
+# S99 matches START=99 in the init script: the kill switch's zone layer is applied from flash by
+# the firewall's own boot and its rule layer is re-installed after netifd's start by the
+# 10-ts-fix-ks hotplug handler, so nothing here needs to precede netifd any more.
 /etc/rc.d/S99ts-fix
 
 # Pre-firewall kill-switch pass symlink (S18 = START=18 in /etc/init.d/ts-fix-preboot; no STOP=,

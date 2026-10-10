@@ -33,16 +33,18 @@
 #   B' armed removal restores zone state — arm, remove: every recorded pair must come back
 #      enabled, the sidecar and ts_fix_lan2ts must be gone, and the config file must be gone
 #      (prerm keeps it on a FAILED disarm, so its absence is the successful-restore signal)
-#   C  hotplug-born — an EVENT-GATED `ifup wan6` landing inside the removal window + a window
-#      sampler on the hotplug-unique writer (reapply, diffed against a pre-removal baseline):
-#      zero born writers, zero residue, wan6 recovers from its own bounce
+#   C  hotplug-born — an EVENT-GATED `ifup wan6` landing inside the removal window, with a window
+#      sampler that records the 20-ts-fix handler file and the live reapply pids (the pids are
+#      diagnostic only): the handler is removed early, the real ifup event lands after it, no
+#      writer survives teardown, zero residue, wan6 recovers from its own bounce
 #   D  parked writer — a REAL reapply parked in its ~33s daemon wait at remove time (daemon
 #      stopped): the drain must WAIT for it (wall-time window), no writer survives teardown
 #
 # The RPDB-era boot guard leg is RETIRED with the mechanism: the pivoted init.d spawns no
 # `ip monitor rule` watcher (zone state is flash-persisted UCI that the firewall re-emits at
-# S19, so there is no boot window to guard). prerm still KILLS that class — a leftovers-cover
-# for a pre-pivot build being removed — and that kill line is deliberately left untested here;
+# S19, so the saved firewall layer is in place before the connection comes up and no watcher is
+# needed). prerm still KILLS that class — a leftovers-cover for a pre-pivot build being removed —
+# and that kill line is deliberately left untested here;
 # it has no live mechanism to exercise, and a synthetic monitor would certify the instrument
 # rather than the product.
 #
@@ -51,7 +53,7 @@
 # blind).
 #
 # PGREP BRACKET AUDIT (obs 112-116: an instrument that matches the mechanism it measures scores
-# itself). Every pgrep here brackets one letter, so the literal text riding the ssh command line
+# itself). Every pgrep -f here brackets one letter, so the literal text riding the ssh command line
 # ("ts-fix-reappl[y]") does NOT contain the string that prerm's own ERE patterns match
 # ("ts-fix-reapply"), and vice versa — neither can see the other. Patterns in this file, checked
 # against the pivoted prerm's three patterns ('ip monitor rul[e]', 'ts-fix-reappl[y]',

@@ -1,6 +1,7 @@
 #!/bin/sh
 # Guard against one BusyBox 1.33 awk trap. Laptop only (needs python3); runs under sh and busybox ash:
-#   sh tests/unit/test-awk-busybox.sh                the fixtures, then every repo file run on a router
+#   sh tests/unit/test-awk-busybox.sh                the fixtures, then the listed repo files
+#                                                    that run awk on a router
 #   sh tests/unit/test-awk-busybox.sh --files F...   the fixtures, then the files given (selftest.sh
 #                                                    uses this for the router-side instruments)
 #
@@ -71,14 +72,15 @@ if [ "${1:-}" = "--files" ]; then
   [ "$#" -gt 0 ] || { nok "--files was given files" "at least one file" "none"; finish; }
   echo "== the files given ($#)"
 else
-  # Every repo file whose awk runs on a router: the package and its scripts, and the test harness
+  # The repo files whose awk runs on a router: the package and its scripts, and the test harness
   # files that run there (router-sampler, prerm-drain, fm2-wan-bounce, and the router-side boot
-  # sampler and kill-switch candidates in tests/lib).
+  # sampler and kill-switch candidates in tests/lib). Not listed: accessories/gl-switch.d/tailscale.sh
+  # and install-gl-tailscale-fix.sh, whose only awk is `{print $1}` and `{print $NF}`.
   set -- "$TD"/src/scripts/* "$TD"/src/hotplug/* "$TD"/src/init.d/* \
     "$TD/pkg/postinst" "$TD/pkg/prerm" "$TD/pkg/postrm" \
     "$TD/tests/lib/router-sampler.sh" "$TD/tests/lib/boot-sampler.sh" "$TD/tests/lib/candidates.sh" \
     "$TD/tests/prerm-drain.sh" "$TD/tests/fm2-wan-bounce.sh"
-  echo "== every repo file run on a router ($#)"
+  echo "== the repo files listed as running awk on a router ($#)"
 fi
 missing=0
 for f in "$@"; do

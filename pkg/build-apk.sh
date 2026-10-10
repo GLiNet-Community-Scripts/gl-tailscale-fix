@@ -45,7 +45,7 @@ fi
 [ -f "$IPK" ] || { echo "ERROR: ipk not found: $IPK" >&2; exit 1; }
 if [ "$(id -u)" != "0" ]; then
     echo "WARNING: not running as root — extracted file ownership will be recorded as $(id -un)," >&2
-    echo "         not root. Run as root or under fakeroot for a shippable package." >&2
+    echo "         not root. Run as root or under 'unshare -r' for a shippable package." >&2
 fi
 
 WORK=$(mktemp -d)

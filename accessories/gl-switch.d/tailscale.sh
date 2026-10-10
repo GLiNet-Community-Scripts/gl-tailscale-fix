@@ -163,12 +163,12 @@ is_fw49_plus() {
 
 # The lockdown is self-contained: its own unreachable-default route in table 101, plus the
 # 5260 rules that point at it, installed and removed as one unit. It deliberately does NOT
-# share a table with the plugin — current plugin versions delete the routing table their
-# older kill switch used, which would silently defang a lockdown built on top of it (5260
+# share a table with the plugin — the plugin deletes its own table-100 route whenever it takes
+# its rule layer down, which would silently defang a lockdown built on top of it (5260
 # rules over an emptied table simply fall through to the next rule and traffic leaks).
 #
-# Table 101 is chosen as unused: clear of Tailscale's table 52 and of the table the plugin's
-# older kill switch used (100). Confirm it is free on your router before deploying — both
+# Table 101 is chosen as unused: clear of Tailscale's table 52 and of the plugin's kill-switch
+# table (100). Confirm it is free on your router before deploying — both
 # `ip route show table 101` and `ip -6 route show table 101` should print nothing.
 #
 # br-iot is covered only when the plugin's kill-switch engine is installed (v1.0.22 and later):
@@ -232,8 +232,9 @@ ks_active() {
     [ -f "$KS_COMMIT_FAIL" ] && return 1
 
     # The plugin's own UCI record of severed uplink forwardings (ts-fix.settings.ks_severed) is
-    # deliberately NOT read here, even though the plugin's own status display reads a non-empty
-    # record as evidence that it is armed. The engine's arm sweep stages that record with a plain
+    # deliberately NOT read here, even though the plugin's own get_config status
+    # (kill_switch_fw_active) reads a non-empty record as evidence that it is armed. The engine's
+    # arm sweep stages that record with a plain
     # `uci add_list` BEFORE it commits UCI and reloads the firewall — and a staged, uncommitted
     # change is visible to `uci get` from any process immediately. So the record can read
     # non-empty while the firewall has not yet been reloaded and the routing rules below do not
@@ -288,7 +289,8 @@ switch_on() {
     # case where the slider was previously bound to one of those and is being rebound
     # here without explicit teardown. Pre-checks avoid spurious "Turning X OFF" MCU
     # notifications when the service wasn't on. With the 5260 lockdown in place above,
-    # there is no leak window during this teardown.
+    # forwarded traffic that reaches it stays blocked during this teardown (GL's priority-0
+    # guest/IoT rules, STEP 1, are the exception).
     wg_status=$(curl -H 'glinet: 1' -s -k "$RPC" -d '{"jsonrpc":"2.0","method":"call","params":["","wg-client","get_status",{}],"id":1}' | jsonfilter -e '@.result.status' 2>/dev/null)
     [ -n "$wg_status" ] && [ "$wg_status" != "0" ] && "$GL_SWITCH_DIR/wireguard.sh" off >/dev/null 2>&1
     # OpenVPN's switch script has its own internal status pre-check, so direct call is safe.
@@ -424,13 +426,14 @@ switch_off() {
     # Disable Tailscale via UCI directly, bypassing GL's RPC. This preserves
     # tailscale.settings.exit_node_ip so the next "on" flip reconnects to the same
     # node — calling GL's set_config would clear it. The gl-tailscale-fix watchdog
-    # detects the enabled=0 transition and tears down the kill switch routing rules
+    # detects the enabled=0 transition and tears down the kill switch (both layers)
     # within ~5 seconds.
     uci set tailscale.settings.enabled='0'
     uci commit tailscale
 
-    # GL firmware 4.9+ keeps its own IPv4 kill switch for the LAN (network.ts_block_lan_leak, a
-    # priority-5280 blackhole) armed for as long as an exit node is set, and only its own
+    # GL firmware 4.9.0 and 4.11.0 keep their own IPv4 kill switch for the main LAN
+    # (network.ts_block_lan_leak, a priority-5280 blackhole) armed while Tailscale is enabled with
+    # an exit node set (the router not itself an exit node, and GL's killswitch setting not 0), and only GL's own
     # Tailscale settings path re-evaluates that rule — this path deliberately goes around that
     # (see above), so run GL's own evaluator directly. With Tailscale now disabled it removes
     # the rule; where the file doesn't exist (pre-4.9) this is a no-op.

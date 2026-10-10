@@ -5,11 +5,15 @@
 # ############################################################################################
 # RETIRED with the two-layer kill switch — kept for the record, not for the current build.
 #
-# It samples the routing layer only: the priority-5279 rules and the table-100 unreachable
-# default. In the v1.0.9-v1.0.22 RPDB builds that layer was the whole kill switch, and netifd's
-# start flushes the entire policy rulebase, so the window before the rules were re-asserted was
-# real exposure, and measurable (10.85-22.2s per boot before the S19 + netlink-guard fix). The
-# current build's boot protection rests on the firewall layer instead: the severed
+# It samples the routing layer only: its rules (priority 5280 through v1.0.20, 5279 from v1.0.21)
+# and the table-100 unreachable default. In the v1.0.12-v1.0.21 releases (and the RPDB-era
+# v1.0.22 dev builds) that layer was the whole kill switch, and netifd's start flushes the entire
+# policy rulebase, so there was a gap
+# before the rules were re-asserted: on a GL-MT3000 on 4.9.0, v1.0.21 installed them 10.85 s after
+# the router's internet route appeared (22.2 s on a second boot), before the S19 + netlink-guard
+# fix. In the one boot watched from a LAN client, IPv6 traffic reached the internet in that gap
+# (on a connection with IPv6) while IPv4 stayed blocked. The current build's boot protection rests
+# on the firewall layer instead: the severed
 # lan/guest/iot -> uplink-class forwardings in /etc/config/firewall, applied by
 # /etc/init.d/firewall at S19, ahead of netifd, so before any WAN route exists. The rules are
 # re-installed after netifd's flush, at the first non-loopback ifup (the 10-ts-fix-ks hotplug
@@ -17,8 +21,8 @@
 # see, so a verdict drawn from its columns (ks4/ks6/t100v4/t100v6) would score that interval as
 # exposure on a correct build: a false red.
 #
-# It also references two things the pivot deleted: the plugin's detached boot guard and its
-# /tmp/ts-fix-boottrace hook (item 5 below) — neither exists in the shipping init.d any more.
+# It also references two things only the RPDB-era v1.0.22 dev builds had: the plugin's detached
+# boot guard and its /tmp/ts-fix-boottrace hook (item 5 below) — neither is in any release.
 #
 # Boot verification is now a plain reboot smoke plus an egress check: reboot the DUT, confirm
 # both layers are back — the recorded pairs still severed and the rule layer in place (the

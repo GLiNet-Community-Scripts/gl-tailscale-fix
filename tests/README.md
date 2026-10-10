@@ -1,8 +1,8 @@
 # gl-tailscale-fix — kill-switch leak test suite
 
 A formalized, repeatable suite for confirming **which mechanism catches each
-failure mode** (Tailscale's built-in KS, either layer of our plugin KS, GL's 9920, or nothing)
-and for proving our kill switch never leaks the real IP. Built to stop us
+failure mode** (Tailscale's built-in KS, either layer of our plugin KS, GL's 9920, GL's 5280 `ts_killswitch`, or nothing)
+and for testing whether our kill switch leaks the real IP. Built to stop us
 re-inventing the test procedure every release, and to produce diffable artifacts
 we can compare version-to-version.
 
@@ -16,6 +16,7 @@ we can compare version-to-version.
 | M1 | Tailscale's built-in KS (daemon-level) | No | Documented "fail close" for expired keys; sudden-offline unverified |
 | M2 | Our plugin KS — two layers, both owned by the engine `ts-fix-ks`. **Firewall layer:** lan/guest/iot → uplink and VPN-client forwardings disabled in `/etc/config/firewall`, recorded in `ts-fix.settings.ks_severed`. **Routing layer:** `ip rule` 5279 on br-lan/br-guest/br-iot → table 100 `unreachable` | **Yes** (saved config + kernel FIB) | A firewall restart clears the firewall layer for a moment; starting the network service clears the routing layer. Protected = either layer holds, per zone and family |
 | M3 | GL's 9920 blackhole | Yes | Inconsistent; absent on 4.9.0 |
+| M4 | GL's `ts_killswitch` (priority 5280 blackhole, `in='lan'`) | Yes | 4.9.0 and 4.11.0; IPv4 on the main LAN only — never IPv6, guest or iot; arms only with Tailscale enabled, an exit node IP set, the router not itself an exit node and GL's `killswitch` not 0; absent on 4.8.4 |
 
 ## Failure-mode → catcher matrix (to verify)
 
@@ -30,7 +31,7 @@ we can compare version-to-version.
 | 5f | DNS leak during any window (resolver egress, not just IP) | separate vector | open |
 
 **Dimensions every test runs across:** family `{v4, v6}` · ingress path
-`{br-lan, br-guest, br-iot}` · firmware `{fw3/4.8, fw3/4.9, fw4/4.8, fw4/4.9}` · binary
+`{br-lan, br-guest, br-iot}` · firmware `{fw3/4.9.0, fw3/4.11.0, fw4/4.8.4}` · binary
 `{OEM 1.80.3, Admon tiny}` · link `{fast wired, slow/hotspot}`. The fw3 br-lan
 clobber and the slow-link watchdog timing are exactly why family/path/fw/link
 are not optional.
@@ -256,10 +257,11 @@ We do **not** assume a block mechanism works because GL uses it. Each candidate 
 4. Recover: `/etc/init.d/tailscale start` (or re-enable in GL UI); `... teardown <candidate>`.
 5. Next candidate. Compare block-vs-leak, the reload window, and boot timing.
 
-GL-`ts_killswitch` efficacy needs a 4.9 router (MT3000) with a Custom Exit Node set and the
-laptop behind it. **To verify (unconfirmed):** netifd honors `action`/`rule6` on fw3+fw4;
-`in=lan`/`guest` → `iif br-lan`/`br-guest` (check `show` — the guest UCI iface name may differ);
-whether `/etc/init.d/network reload` opens a transient gap.
+GL-`ts_killswitch` efficacy needs a 4.9.0 or 4.11.0 router (GL's script is identical on both;
+absent on 4.8.4) with a Custom Exit Node set and the
+laptop behind it. **Confirmed:** GL's `in='lan'` rule shows as `from all iif br-lan blackhole` at
+priority 5280 (IPv4 only). **Still to verify:** whether `/etc/init.d/network reload` opens a
+transient gap.
 
 ## Status
 

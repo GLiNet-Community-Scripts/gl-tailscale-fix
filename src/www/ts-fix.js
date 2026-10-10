@@ -258,9 +258,9 @@ function initTooltip() {
 
 var TIPS = {
   exitNode: 'Advertise this router as a Tailscale exit node so remote devices can route all traffic through it. Requires "Allow Remote Access WAN" to be enabled above.',
-  killSwitch: 'Two-layer kill switch - Closes the firewall forwardings from LAN, Guest and IoT to the WAN, and adds policy routing that blocks the same traffic, so while it is enabled these devices reach the internet only through the exit-node tunnel and your real IP cannot leak if the tunnel drops, tailscaled crashes, or the daemon restarts. Stays armed until you turn it off or disable Tailscale - removing the exit node does NOT disable it (traffic stays blocked, fail-secure) unless "Kill Switch Follows Exit Node" below is enabled. While a Custom Exit Node is in use, run no other routing on the router: no VPN client (WireGuard, OpenVPN, AmneziaWG), no ZeroTier routing (overlay for management and remote access only) and no Tor.',
+  killSwitch: 'Two-layer kill switch - Closes the firewall forwardings from LAN, Guest and IoT to the WAN, and adds policy routing that blocks the same traffic, so while it is enabled these devices reach the internet only through the exit-node tunnel, and their traffic stays blocked if the tunnel drops, tailscaled crashes, or the daemon restarts. Stays armed until you turn it off or disable Tailscale - removing the exit node does NOT disable it (traffic stays blocked, fail-secure) unless "Kill Switch Follows Exit Node" below is enabled. While a Custom Exit Node is in use, run no other routing on the router: no VPN client (WireGuard, OpenVPN, AmneziaWG), no ZeroTier routing (overlay for management and remote access only) and no Tor.',
   ksFollow: 'Automatically arm the Kill Switch whenever a Custom Exit Node is configured, and disarm it when the exit node selection is cleared. With this on, turning Custom Exit Node off also turns the Kill Switch off, and traffic uses your normal connection until you pick a new exit node. To switch exit nodes without a gap, leave this off. Tracks GL\'s stored Custom Exit Node setting (applied within ~5 seconds). Leave off to control the Kill Switch manually. Note: on some pre-4.9 firmware GL can leave a stale exit-node value after disabling Custom Exit Node - if the Kill Switch arms unexpectedly, clear the Custom Exit Node selection or turn this off.',
-  hideTsDomain: 'Stops the router advertising your Tailscale tailnet name (for example x.ts.net) to devices on your network, and keeps your own local domain instead. Tailnet names still resolve - only the advertised search-domain hint is removed. Useful if the tailnet name breaks local .lan name resolution, or if you would rather not hand connected devices a hint that Tailscale is in use.',
+  hideTsDomain: 'Stops the router advertising your Tailscale tailnet name (for example x.ts.net) to devices on your network, and keeps your own local domain instead. Full tailnet names (host.your-tailnet.ts.net) still resolve - only the advertised search-domain hint is removed. Useful if the tailnet name breaks local .lan name resolution, or if you would rather not hand connected devices a hint that Tailscale is in use.',
   routeGuest: 'Extends GL\'s "Allow Remote Access" to the Guest network. Adds Guest\u2194Tailscale forwardings and advertises the guest subnet to your tailnet.',
   tailscaleSsh: 'Enable Tailscale\'s ACL-based SSH authentication for this router. Most users don\'t need this \u2014 SSH to the router\'s Tailscale IP already works through the normal SSH daemon (Dropbear) without any extra setup. Enable this only if you specifically want identity-based access controlled by a Tailscale SSH ACL rule (Access Controls \u2192 Tailscale SSH tab). While enabled, tailscaled takes over port 22 for tailnet-origin traffic, which breaks SSH from LAN clients that reach the router via Tailscale subnet routing. In that case, run Dropbear on an alternate port (System \u2192 Administration \u2192 SSH Access) to keep a path open for both Tailscale and LAN clients.',
   version: 'Manage Tailscale binary version. Combined binaries provided by admonstrator/glinet-tailscale-updater.'
@@ -323,7 +323,8 @@ function buildSection() {
   // Allow Remote Access Guest (extends native GL function)
   section.appendChild(createToggleRow('route-guest', 'Allow Remote Access Guest', TIPS.routeGuest));
 
-  // Kill Switch (extends native Custom Exit Node — shown when exit node client mode is active)
+  // Kill Switch (extends native Custom Exit Node — shown when an exit node is configured, and
+  // always while the Kill Switch is on so an armed one stays reversible; see refreshUI)
   section.appendChild(createToggleRow('kill-switch', 'Kill Switch', TIPS.killSwitch, {hidden: true}));
 
   // Kill Switch follows Custom Exit Node (opt-in convenience — watchdog-enforced)
@@ -506,7 +507,8 @@ function refreshUI() {
   setToggle('hide-ts-domain', state.hide_ts_domain, notReady);
   setToggle('tailscale-ssh', state.tailscale_ssh, notReady);
   // Kill Switch stays operable while tailscaled is down (claim-6, v1.0.22):
-  // the KS is kernel policy routing, deliberately daemon-independent, and the
+  // both KS layers (severed firewall forwardings and kernel policy routing) are
+  // deliberately daemon-independent, and the
   // RPC path behind it only needs Tailscale enabled in UCI — no CLI calls. A
   // user sitting dark behind an armed KS with a dead daemon must be able to
   // disarm (or arm) from this page instead of being stranded. Same for the
@@ -578,9 +580,11 @@ function refreshUI() {
 
 // -- 4.9+ informational banner --
 // GL firmware 4.9 added native Advertise Exit Node, WAN subnet advertisement,
-// and IP Masquerading. This plugin still provides what GL doesn't: a
-// daemon-independent kernel-level Kill Switch, Guest routing through the
-// exit node, the Version Manager, and the Tailscale SSH toggle.
+// IP Masquerading and its own Tailscale kill switch (/usr/bin/ts_killswitch on
+// 4.9.0 and 4.11.0: one IPv4 rule for the main LAN only). This plugin still
+// provides what GL doesn't: a daemon-independent Kill Switch that also covers
+// guest, IoT and IPv6, Guest routing through the exit node, the Version
+// Manager, and the Tailscale SSH toggle.
 
 function ensureInformationalBanner() {
   var section = document.getElementById(INJECT_ID);
@@ -633,7 +637,7 @@ function ensureInformationalBanner() {
 
   var ul = document.createElement('ul');
   ul.style.cssText = 'margin:6px 0 6px 18px;padding:0;';
-  ['Kill Switch with kernel-level protection that persists through daemon restarts',
+  ['Kill Switch that persists through daemon restarts and also covers Guest, IoT and IPv6 (GL\u2019s own covers the main LAN on IPv4 only)',
    'Guest network routing through the exit node',
    'Tailscale Version Manager',
    'Tailscale SSH toggle'].forEach(function(t) {
@@ -1028,9 +1032,10 @@ function reapplyAfterGlRestart() {
     var needReapply = false;
 
     // Only reapply tailscale-level settings that "tailscale up --reset" clears.
-    // Kill switch uses kernel ip rules/routes which survive the restart and are
-    // maintained by ts-fix-reapply on the user's intent alone — no reapply
-    // needed here. On 4.9+, skip advertise_exit_node — GL manages it natively.
+    // The kill switch (severed forwardings plus kernel ip rules) is held by its
+    // engine, /usr/bin/ts-fix-ks, on the user's intent alone — reapply, the
+    // hotplug handlers and the watchdog's 5s check all drive it — so no reapply
+    // is needed here. On 4.9+, skip advertise_exit_node — GL manages it natively.
     if (state.advertise_exit_node && !state.firmware_49_plus) {
       params.advertise_exit_node = true;
       needReapply = true;

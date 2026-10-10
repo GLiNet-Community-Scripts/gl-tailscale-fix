@@ -28,16 +28,16 @@ check() {
     fi
 }
 
-check "4.9 replace form (bare suffix)"        "rove-lenok.ts.net"          ""
-check "4.8 append form"                       "rove-lenok.ts.net lan"      "lan"
-check "4.8 append, custom local domain"       "rove-lenok.ts.net home"     "home"
+check "4.9.0 and 4.11.0 replace form (bare suffix)" "your-tailnet.ts.net"         ""
+check "4.8.4 prepend form"                        "your-tailnet.ts.net lan"     "lan"
+check "4.8.4 prepend, custom local domain"        "your-tailnet.ts.net home"    "home"
 check "GL bare ts.net fallback alone"         "ts.net"                     ""
-check "GL bare ts.net fallback, appended"     "ts.net lan"                 "lan"
+check "GL bare ts.net fallback, prepended"    "ts.net lan"                 "lan"
 check "already clean"                         "lan"                        "lan"
 check "already clean, multi-token"            "lan guest wan"              "lan guest wan"
 check "empty input"                           ""                           ""
 check "duplicate tailnet tokens"              "a.ts.net b.ts.net lan"      "lan"
-check "suffix in the middle"                  "lan rove-lenok.ts.net wan"  "lan wan"
+check "suffix in the middle"                  "lan your-tailnet.ts.net wan"  "lan wan"
 check "lookalike domain is NOT stripped"      "notts.net lan"              "notts.net lan"
 check "lookalike subdomain is NOT stripped"   "ts.net.example.com lan"     "ts.net.example.com lan"
 

@@ -53,7 +53,7 @@ install -m 755 "$ROOT_DIR/src/hotplug/20-ts-fix" "$DATA/etc/hotplug.d/iface/20-t
 install -m 755 "$ROOT_DIR/src/hotplug/10-ts-fix-ks" "$DATA/etc/hotplug.d/iface/10-ts-fix-ks"
 install -m 755 "$ROOT_DIR/src/hotplug/98-ts-fix-isolate6" "$DATA/etc/hotplug.d/iface/98-ts-fix-isolate6"
 
-# Procd init script (UCI reload trigger)
+# Procd init script (boot kill-switch check + watchdog service)
 install -d "$DATA/etc/init.d"
 install -m 755 "$ROOT_DIR/src/init.d/ts-fix" "$DATA/etc/init.d/ts-fix"
 # Pre-firewall kill-switch pass (plain rc.common one-shot at START=18, not procd)

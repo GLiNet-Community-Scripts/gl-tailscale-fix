@@ -17,8 +17,9 @@
 # `uci -q get` prints nothing and returns 1 both for an absent option and for a read that failed,
 # so it cannot tell "off" from "unknown", and a failed read taken for "off" tears protection down.
 # `uci -q show <pkg>.settings` can: a readable section prints its own "<pkg>.settings=<type>" line
-# first, and a failed read prints nothing. An option absent from a readable section is off (GL's
-# slider accessory deletes tailscale.settings.enabled to restore its never-set state); a failed read
+# first, and a failed read prints nothing. An option absent from a readable section is off (the
+# side-switch accessory, accessories/gl-switch.d/tailscale.sh, deletes tailscale.settings.enabled
+# to restore its never-set state); a failed read
 # is UNKNOWN, and no caller may act on it as off. Shell matching only: no fork beyond the uci call.
 #
 # ts_state — tailscale.settings, read once: ts_en is 1 when it holds enabled='1', 0 for any other

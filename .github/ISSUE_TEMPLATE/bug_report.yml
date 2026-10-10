@@ -30,7 +30,7 @@ body:
     attributes:
       label: gl-tailscale-fix Version
       description: Shown in the "Tailscale Enhanced" section header
-      placeholder: "1.0.11"
+      placeholder: "1.0.22"
     validations:
       required: true
 
@@ -47,8 +47,13 @@ body:
       label: Which feature is affected?
       options:
         - Kill Switch
+        - Kill Switch Follows Exit Node
         - Allow Remote Access Guest
         - Advertise as Exit Node
+        - Tailscale SSH
+        - Hide Tailscale Search Domain
+        - Block WAN Subnets (IPv6)
+        - Subnet Routing (masquerade)
         - Tailscale Version Manager
         - UI / Display
         - Install / Upgrade / Remove
@@ -84,6 +89,7 @@ body:
       description: |
         If applicable, include output from:
         - `logread | grep ts-fix` (syslog messages)
-        - `ip rule list` (routing rules)
+        - `ip rule list` and `ip -6 rule list` (routing rules, IPv4 and IPv6)
         - `uci show ts-fix` (plugin config)
+        Before posting, remove your tailnet name (the part in front of `.ts.net`) and any public IP addresses.
       render: shell

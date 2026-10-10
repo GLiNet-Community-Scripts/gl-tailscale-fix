@@ -15,7 +15,7 @@
 #
 # Design C: the kill switch is NOT torn down on exit-node removal — only on a
 # Tailscale disable (here) or the user turning the KS toggle off (RPC/reapply).
-# It stays armed through restart transients, fail-secure (block, never leak).
+# It stays armed through restart transients, fail-secure (block rather than leak).
 # The optional ks_follow_exit_node mode below is the one deliberate exception,
 # and it keys on GL's durable exit_node_ip UCI — never the daemon's transient
 # ExitNodeID — so restart transients still cannot flap it.
@@ -232,8 +232,9 @@ iso6_backstop() {
 # `uci -q get` prints nothing and returns 1 both for an absent option and for a read that failed,
 # so it cannot tell "off" from "unknown", and a failed read taken for "off" tears protection down.
 # `uci -q show <pkg>.settings` can: a readable section prints its own "<pkg>.settings=<type>" line
-# first, and a failed read prints nothing. An option absent from a readable section is off (GL's
-# slider accessory deletes tailscale.settings.enabled to restore its never-set state); a failed read
+# first, and a failed read prints nothing. An option absent from a readable section is off (the
+# side-switch accessory, accessories/gl-switch.d/tailscale.sh, deletes tailscale.settings.enabled
+# to restore its never-set state); a failed read
 # is UNKNOWN, and no caller may act on it as off. Shell matching only: no fork beyond the uci call.
 #
 # ts_state — tailscale.settings, read once: ts_en is 1 when it holds enabled='1', 0 for any other
@@ -317,7 +318,7 @@ wd_poll() {
     # and the teardown it used to trigger committed kill_switch=0.
     #
     # This reads intent rather than probing the kill switch itself, which makes it a strict
-    # superset of the RPDB-era rule probe it replaced: that one could only fire while the kill
+    # superset of the v1.0.21 rule probe it replaced: that one could only fire while the kill
     # switch was armed. Neither kill-switch layer — the severed forwardings in flash-persisted
     # firewall UCI, nor the priority-5279 rules and their table-100 route — is checked here: the
     # ts-fix-ks check pass below owns both, in both directions, on every poll.
