@@ -1,0 +1,157 @@
+name: Sync Fork with Upstream
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # daily at 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run – merge locally but do not push'
+        type: boolean
+        default: false
+      protect_workflows:
+        description: 'Restore .github/workflows from fork after sync'
+        type: boolean
+        default: true
+      force_sync:
+        description: 'Force push even if the fork branch has diverged (overwrites fork history!)'
+        type: boolean
+        default: false
+
+jobs:
+  sync:
+    name: Sync fork
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Detect upstream repository
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PARENT=$(gh api repos/${{ github.repository }} --jq '.parent.full_name // empty')
+          if [ -z "$PARENT" ]; then
+            echo "This repository is not a fork or has no parent repository. Aborting." >&2
+            exit 1
+          fi
+          DEFAULT_BRANCH=$(gh api repos/$PARENT --jq '.default_branch')
+          echo "repo=$PARENT" >> "$GITHUB_OUTPUT"
+          echo "branch=$DEFAULT_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Capture current HEAD
+        id: pre_sync
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Sync with upstream
+        id: sync
+        env:
+          OPT_DRY_RUN:           ${{ inputs.dry_run           || 'false' }}
+          OPT_PROTECT_WORKFLOWS: ${{ inputs.protect_workflows || 'true'  }}
+          OPT_FORCE_SYNC:        ${{ inputs.force_sync        || 'false' }}
+        run: |
+          PRE_SHA="${{ steps.pre_sync.outputs.sha }}"
+          BRANCH="${{ steps.upstream.outputs.branch }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${{ steps.upstream.outputs.repo }}.git"
+          git fetch upstream
+          git checkout "$BRANCH"
+
+          if [ "$OPT_FORCE_SYNC" = "true" ]; then
+            git reset --hard "upstream/$BRANCH"
+          elif [ "$OPT_PROTECT_WORKFLOWS" = "true" ]; then
+            # Merge without auto-commit so we can enforce local workflow files
+            # before creating the merge commit.
+            set +e
+            git merge --no-commit --no-ff "upstream/$BRANCH"
+            MERGE_EXIT=$?
+            set -e
+
+            # If merge failed, only continue when conflicts are limited to workflows.
+            if [ "$MERGE_EXIT" -ne 0 ]; then
+              CONFLICTS=$(git diff --name-only --diff-filter=U)
+              NON_WORKFLOW_CONFLICTS=$(echo "$CONFLICTS" | grep -vE '^\.github/workflows/' || true)
+              if [ -n "$NON_WORKFLOW_CONFLICTS" ]; then
+                echo "Conflicts outside .github/workflows detected:" >&2
+                echo "$NON_WORKFLOW_CONFLICTS" >&2
+                exit 1
+              fi
+            fi
+
+            # Remove all synced workflow files first, then restore exactly
+            # what existed on the fork before sync.
+            git rm -r --ignore-unmatch .github/workflows
+
+            if git cat-file -e "$PRE_SHA":.github/workflows 2>/dev/null; then
+              git restore --source="$PRE_SHA" --staged --worktree .github/workflows
+            fi
+
+            # Stage via .github so this does not fail when workflows do not exist.
+            git add -A .github
+
+            # Fail fast if unresolved conflicts remain.
+            if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+              echo "Unresolved merge conflicts remain:" >&2
+              git diff --name-only --diff-filter=U >&2
+              exit 1
+            fi
+
+            # Finalize merge only when a merge is actually in progress.
+            if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+              git commit --no-edit
+            fi
+          else
+            git merge --no-edit "upstream/$BRANCH"
+          fi
+
+          if [ "$OPT_DRY_RUN" = "true" ]; then
+            echo "Dry run enabled – skipping push."
+          elif [ "$OPT_FORCE_SYNC" = "true" ]; then
+            git push --force origin "$BRANCH"
+          else
+            git push origin "$BRANCH"
+          fi
+
+      - name: Write job summary
+        if: always()
+        run: |
+          echo "## Sync Fork with Upstream" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Fork** | \`${{ github.repository }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Upstream** | \`${{ steps.upstream.outputs.repo }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Branch** | \`${{ steps.upstream.outputs.branch }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Triggered by** | \`${{ github.event_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Dry run** | ${{ inputs.dry_run == true && '✅ Yes' || '❌ No' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Protect workflows** | ${{ inputs.protect_workflows == false && '❌ No' || '✅ Yes' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Force sync** | ${{ inputs.force_sync == true && '⚠️ Yes' || '❌ No' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Run at** | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Status** | ${{ steps.sync.outcome == 'success' && '✅ Success' || '❌ Failed' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          PRE_SHA="${{ steps.pre_sync.outputs.sha }}"
+          NEW_COMMITS=$(git log "$PRE_SHA"..HEAD --oneline 2>/dev/null)
+
+          if [ -n "$NEW_COMMITS" ]; then
+            echo "### New commits" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| SHA | Message |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            git log "$PRE_SHA"..HEAD --pretty=format:"%h|%s" | while IFS='|' read -r sha msg; do
+              REPO="${{ steps.upstream.outputs.repo }}"
+              echo "| [\`$sha\`](https://github.com/$REPO/commit/$sha) | $msg |" >> "$GITHUB_STEP_SUMMARY"
+            done
+          else
+            echo "_No new commits – fork was already up to date._" >> "$GITHUB_STEP_SUMMARY"
+          fi
