@@ -94,7 +94,7 @@ Download the latest `.ipk` from [Releases](https://github.com/RemoteToHome-io/gl
 SSH into your router and run:
 
 ```sh
-wget -q https://github.com/RemoteToHome-io/gl-tailscale-fix/releases/latest/download/install-gl-tailscale-fix.sh -O install-gl-tailscale-fix.sh && sh install-gl-tailscale-fix.sh
+curl -fsSL -o install-gl-tailscale-fix.sh https://github.com/RemoteToHome-io/gl-tailscale-fix/releases/latest/download/install-gl-tailscale-fix.sh && sh install-gl-tailscale-fix.sh
 ```
 
 The installer downloads the latest `.ipk`, verifies the sha256 checksum, and runs `opkg install`. It also automatically restores the stock `gl_tailscale` wrapper if you previously modified it for exit node support.
@@ -135,7 +135,7 @@ v1.0.21 package installed cleanly there). GL's web uploader rejects unsigned pac
 over SSH:
 
 ```sh
-wget -O /tmp/gl-tailscale-fix.apk https://github.com/RemoteToHome-io/gl-tailscale-fix/releases/download/v1.0.22/gl-tailscale-fix-1.0.22-beta-untested.apk
+curl -fsSL -o /tmp/gl-tailscale-fix.apk https://github.com/RemoteToHome-io/gl-tailscale-fix/releases/download/v1.0.22/gl-tailscale-fix-1.0.22-beta-untested.apk
 apk add --allow-untrusted /tmp/gl-tailscale-fix.apk
 ```
 
@@ -401,12 +401,14 @@ Found a bug? Have a feature request? Tested on a new router model?
 - **Pull requests**: Welcome. The plugin is pure Lua, shell, and vanilla JS — no build toolchain required. See [Architecture](#architecture) for how the pieces fit together.
 - **Model testing**: If you verify gl-tailscale-fix on a GL.iNet model not in the [tested models](#tested-models) table, please open an issue with your model, firmware version, and test results.
 
+- **Release timing**: Please be kind. This project is maintained out of limited personal time.  Each release takes a *minimum of 10 hours* running live bench testing across router models - this on top of the coding time.  This includes re-configuring and wiring up multiple routers and laptops to do live leak testing of all the potential data paths.  Security testing is done with hands-on configuration and live hardware testing/monitoring, not AI simulations.  As a security-focused plugin, no new features make it in without a new full-suite bench test cycle.
+
 ## Attribution
 
 - Tailscale combined binaries from [glinet-tailscale-updater](https://github.com/Admonstrator/glinet-tailscale-updater) by @Admonstrator
 - [TheWiredNomad](https://thewirednomad.com/) for feedback and testing
 - Beta testers and feedback from the GL.iNet community
-- Claude for hashing out the Lua/frontend, readme docs and code reviews
+- Claude for hashing out the Lua/frontend, docs and code reviews & Chat for adversarial security testing. This project started as a hand-built internal tool for helping secure RTH Consulting's customers using TS, but we have obviously embraced AI as it's evolved to enhance and extend (with human code review), making the UI now user-friendly enough to be a public offering. 
 
 ## License
 
